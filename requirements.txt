@@ -1,0 +1,39 @@
+# Core dependencies for RAGAF-Diffusion
+# Install in this order to avoid conflicts
+
+# Step 1: Core PyTorch (install first)
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Step 2: HuggingFace ecosystem
+transformers>=4.30.0
+diffusers>=0.21.0
+accelerate>=0.20.0
+
+# Step 3: Data processing
+numpy>=1.24.0
+opencv-python>=4.8.0
+scipy>=1.10.0
+scikit-image>=0.21.0
+pillow>=9.5.0
+
+# Step 4: Graph processing
+networkx>=3.1
+
+# Step 5: Dataset handling
+pycocotools>=2.0.6
+
+# Step 6: Visualization and logging
+matplotlib>=3.7.0
+tensorboard>=2.13.0
+
+# Step 7: Utilities
+tqdm>=4.65.0
+pyyaml>=6.0
+einops>=0.6.0
+
+# Optional (can install later if needed)
+# xformers>=0.0.20  # For efficient attention (requires CUDA)
+# peft>=0.4.0  # For LoRA adapters
+# wandb>=0.15.0  # For experiment tracking
+# torch-geometric>=2.3.0  # For advanced graph features
