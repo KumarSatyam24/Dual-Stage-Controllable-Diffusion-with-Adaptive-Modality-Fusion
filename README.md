@@ -293,7 +293,7 @@ Sketch → Regions → Graph → Spatial Context → Text Relevance → Adaptive
 
 ---
 
-## � Advantages Over Existing Methods
+##  Advantages Over Existing Methods
 
 ### Comparison with State-of-the-Art
 
@@ -408,7 +408,7 @@ where: x_t = √ᾱ_t x₀ + √(1-ᾱ_t) ε
 
 ---
 
-## 🏗️ Architecture Diagram
+##  Architecture Diagram
 
 <div align="center">
 
@@ -549,7 +549,7 @@ where: x_t = √ᾱ_t x₀ + √(1-ᾱ_t) ε
 
 </div>
 
-### � Component Details
+###  Component Details
 
 #### **Region Extraction Pipeline**
 ```python
@@ -602,7 +602,7 @@ RAGAFAttentionModule(
     num_attention_heads=8,   # Multi-head attention
     dropout=0.1
 )
-# Total parameters: ~4.08M
+# Total parameters: ~4.08M (approx.)
 ```
 
 ---
@@ -717,17 +717,17 @@ TEXT: "A modern minimalist living room with natural wood furniture"
 GRAPH ATTENTION BENEFITS:
 
 Without Graph Attention (Independent):
-❌ Sofa: Modern style
-❌ Table: Random wood type (oak)
-❌ Lamp: Different metal (brass)
-❌ Overall: Incoherent mixture
+ Sofa: Modern style
+ Table: Random wood type (oak)
+ Lamp: Different metal (brass)
+ Overall: Incoherent mixture
 
 With Graph Attention (RAGAF):
-✅ Sofa: Modern minimalist → Influences neighbors
-✅ Table: Adopts same wood type (walnut) via attention to sofa
-✅ Lamp: Coordinates metal finish via attention to table
-✅ Floor: Harmonizes with furniture via global attention
-✅ Overall: Coherent, unified aesthetic
+ Sofa: Modern minimalist → Influences neighbors
+ Table: Adopts same wood type (walnut) via attention to sofa
+ Lamp: Coordinates metal finish via attention to table
+ Floor: Harmonizes with furniture via global attention
+ Overall: Coherent, unified aesthetic
 
 GRAPH ATTENTION MECHANISM:
     Window(r₄)
@@ -744,7 +744,7 @@ Each region "sees" its neighbors and adjusts its features for coherence!
 
 ##  Implementation & Practical Usage
 
-### Sketchy Dataset (Primary)  **VALIDATED & READY**
+### Sketchy Dataset (Primary) 
 
 <div align="center">
 
@@ -763,7 +763,7 @@ Each region "sees" its neighbors and adjusts its features for coherence!
 
 **Categories Include:** airplane, apple, bear, bicycle, cat, dog, elephant, guitar, horse, house, motorcycle, penguin, piano, rabbit, shoe, tree, and 109 more!
 
-### MS COCO (Secondary - Optional)
+### MS COCO (Secondary)
 
 - **Purpose**: Multi-object complex scenes
 - **Size**: ~25 GB (images + annotations)
@@ -779,7 +779,7 @@ Each region "sees" its neighbors and adjusts its features for coherence!
 
 ##  Quick Start
 
-### ⚡ Installation (5 minutes)
+###  Installation 
 
 ```bash
 # 1. Clone repository
@@ -793,7 +793,7 @@ pip install -r requirements.txt
 python verify_dataset.py  # If you have datasets downloaded
 ```
 
-###  Dataset Setup (Optional - for training)
+###  Dataset Setup
 
 **Option 1: Automatic Setup (Sketchy)**
 ```bash
@@ -1121,123 +1121,11 @@ use_region_adaptive_fusion = True
 use_lora = True
 lora_rank = 4
 ```
-
-### Custom Configuration
-
-**Method 1: Command Line**
-```bash
-python train.py \
-    --learning_rate 5e-5 \
-    --batch_size 8 \
-    --hidden_dim 768 \
-    --num_graph_layers 3
-```
-
-**Method 2: YAML File**
-```yaml
-# config_custom.yaml
-model:
-  hidden_dim: 768
-  num_graph_layers: 3
-  fusion_method: "hybrid"
-
-training:
-  learning_rate: 5e-5
-  batch_size: 8
-  stage1_epochs: 15
-  stage2_epochs: 15
-```
-
-```bash
-python train.py --config config_custom.yaml
-```
-
----
-
-## Memory Optimization
-
-For limited GPU memory:
-
-```bash
-# Use smaller batch size
---batch_size 2
-
-# Use gradient accumulation
---gradient_accumulation_steps 4
-
-# Use mixed precision
---mixed_precision fp16
-
-# Freeze base UNet (train only RAGAF components)
---freeze_base_unet
-```
-
-## 📈 Monitoring & Logging
-
-### Weights & Biases (Recommended)
-
-```bash
-# Enable W&B logging
-python train.py --use_wandb --wandb_project ragaf-diffusion --wandb_run_name exp_001
-
-# Tracked metrics:
-# • Training/validation loss (stage 1 & 2)
-# • Learning rate schedule
-# • Fusion weights (sketch α vs text β)
-# • Region-text attention maps
-# • Generated sample images
-# • GPU memory usage
-# • Training speed (samples/sec)
-```
-
-**Dashboard Features:**
-- 📊 Real-time loss curves
-- 🖼️ Generated image samples every N epochs
-- 🎯 Attention map visualizations
-- ⚡ Training speed metrics
-- 💾 Automatic model versioning
-
-### TensorBoard
-
-```bash
-# Launch TensorBoard
-tensorboard --logdir ./checkpoints --port 6006
-
-# View at http://localhost:6006
-
-# Logged data:
-# • Scalars: Loss, LR, fusion weights
-# • Images: Generated samples, attention maps
-# • Histograms: Model gradients, activations
-# • Graphs: Model architecture
-```
-
-### Console Logging
-
-```bash
-# Training progress display:
-Epoch 1/10 [Stage 1] ━━━━━━━━━━━━━━━━━━━━ 100% 0:05:23
-├── Train Loss: 0.1234
-├── Val Loss: 0.1567
-├── LR: 1.0e-04
-├── Samples/sec: 12.5
-└── ETA: 4h 32m
-
-Epoch 1/10 [Stage 2] ━━━━━━━━━━━━━━━━━━━━ 100% 0:06:45
-├── Train Loss: 0.0987
-├── Val Loss: 0.1123
-├── Sketch Weight (α): 0.35
-├── Text Weight (β): 0.65
-└── Attention Entropy: 2.45
-```
-
 ---
 
 ##  Evaluation
 
 ### Metrics (Coming Soon)
-
-We will provide evaluation scripts for:
 
 **Image Quality:**
 - **FID** (Fréchet Inception Distance) - Overall image quality
