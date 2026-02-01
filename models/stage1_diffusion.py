@@ -305,7 +305,8 @@ class Stage1SketchGuidedDiffusion(nn.Module):
         if return_dict:
             return noise_pred
         else:
-            return noise_pred.sample
+            # When return_dict=False, UNet returns a tuple (noise_pred,)
+            return noise_pred[0] if isinstance(noise_pred, tuple) else noise_pred.sample
     
     def get_trainable_parameters(self):
         """

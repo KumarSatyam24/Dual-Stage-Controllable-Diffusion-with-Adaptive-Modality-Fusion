@@ -48,8 +48,8 @@ class DataConfig:
     
     # Datasets
     dataset_name: str = "sketchy"  # "sketchy", "coco", "both"
-    sketchy_root: str = "/path/to/sketchy/dataset"
-    coco_root: str = "/path/to/coco/dataset"
+    sketchy_root: str = "/workspace/datasets/sketchy"  # RunPod network volume
+    coco_root: str = "/workspace/datasets/coco"  # RunPod network volume
     
     # Data processing
     image_size: int = 512
@@ -79,8 +79,8 @@ class TrainingConfig:
     
     # Training stages
     train_stage: str = "both"  # "stage1", "stage2", "both"
-    stage1_epochs: int = 10
-    stage2_epochs: int = 10
+    stage1_epochs: int = 2
+    stage2_epochs: int = 2
     
     # Optimization
     learning_rate: float = 1e-4
@@ -98,7 +98,7 @@ class TrainingConfig:
     gradient_accumulation_steps: int = 1
     
     # Mixed precision
-    mixed_precision: str = "fp16"  # "no", "fp16", "bf16"
+    mixed_precision: str = "no"  # "no", "fp16", "bf16" - Using "no" to avoid grad scaler issues
     
     # Diffusion
     num_train_timesteps: int = 1000
@@ -111,7 +111,7 @@ class TrainingConfig:
     
     # Logging
     log_every_n_steps: int = 10
-    use_wandb: bool = True
+    use_wandb: bool = False  # Disabled by default (install wandb if needed)
     wandb_project: str = "ragaf-diffusion"
     wandb_run_name: Optional[str] = None
     

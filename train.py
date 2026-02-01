@@ -148,12 +148,14 @@ class RAGAFDiffusionTrainer:
             subfolder="vae"
         )
         self.vae.requires_grad_(False)  # Freeze VAE
+        self.vae.to(self.accelerator.device)  # Move to device
         
         self.text_encoder = CLIPTextModel.from_pretrained(
             self.model_config.pretrained_model_name,
             subfolder="text_encoder"
         )
         self.text_encoder.requires_grad_(False)  # Freeze text encoder
+        self.text_encoder.to(self.accelerator.device)  # Move to device
         
         self.tokenizer = CLIPTokenizer.from_pretrained(
             self.model_config.pretrained_model_name,
@@ -259,24 +261,40 @@ class RAGAFDiffusionTrainer:
                 num_training_steps=len(self.train_dataloader) * self.training_config.stage2_epochs
             )
     
-    def train_stage1_step(self, batch: Dict) -> Dict:
+    def train_stage1_step(self, batch: Dict, model=None) -> Dict:
         """
         Single training step for Stage 1.
         
         Args:
             batch: Batch of data
+            model: Model to use (if None, uses self.stage1_model)
         
         Returns:
             Dict with loss and metrics
         """
+        # Use provided model or fall back to self.stage1_model
+        stage1_model = model if model is not None else self.stage1_model
+        
         sketches = batch["sketch"].to(self.accelerator.device)
         photos = batch["photo"].to(self.accelerator.device)
         text_prompts = batch["text_prompt"]
+        
+        # Debug first batch
+        if not hasattr(self, '_debug_done'):
+            print(f"\nDEBUG batch shapes:")
+            print(f"  sketches: {sketches.shape}, dtype: {sketches.dtype}")
+            print(f"  photos: {photos.shape}, dtype: {photos.dtype}")
+            print(f"  Model type: {type(stage1_model)}")
+            print(f"  Model module type: {type(stage1_model.module) if hasattr(stage1_model, 'module') else 'no module attr'}")
+            self._debug_done = True
         
         # Encode images to latents
         with torch.no_grad():
             latents = self.vae.encode(photos).latent_dist.sample()
             latents = latents * 0.18215
+        
+        # Detach latents (VAE gradients not needed)
+        latents = latents.detach()
         
         # Sample noise
         noise = torch.randn_like(latents)
@@ -292,34 +310,54 @@ class RAGAFDiffusionTrainer:
         noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
         
         # Encode sketch
-        sketch_features = self.stage1_model.encode_sketch(sketches)
+        sketch_features = stage1_model.encode_sketch(sketches)
         
         # Encode text
-        text_embeddings = self.stage1_model.encode_text(text_prompts)
+        text_embeddings = stage1_model.encode_text(text_prompts)
+        
+        # Check if we're in no_grad mode
+        if not hasattr(self, '_debug_done3'):
+            print(f"\nDEBUG grad mode:")
+            print(f"  torch.is_grad_enabled(): {torch.is_grad_enabled()}")
+            print(f"  Model training: {stage1_model.training}")
+            self._debug_done3 = True
         
         # Predict noise
-        noise_pred = self.stage1_model(
+        noise_pred = stage1_model(
             noisy_latents,
             timesteps,
             sketch_features,
             text_embeddings
         )
         
+        # Debug first batch
+        if not hasattr(self, '_debug_done2'):
+            print(f"\nDEBUG tensor info:")
+            print(f"  noisy_latents.requires_grad: {noisy_latents.requires_grad}")
+            print(f"  noise_pred.requires_grad: {noise_pred.requires_grad}")
+            print(f"  noise_pred.grad_fn: {noise_pred.grad_fn}")
+            print(f"  noise.requires_grad: {noise.requires_grad}")
+            self._debug_done2 = True
+        
         # Compute loss
         loss = F.mse_loss(noise_pred, noise)
         
         return {"loss": loss}
     
-    def train_stage2_step(self, batch: Dict) -> Dict:
+    def train_stage2_step(self, batch: Dict, model=None) -> Dict:
         """
         Single training step for Stage 2.
         
         Args:
             batch: Batch of data
+            model: Model to use (if None, uses self.stage2_model)
         
         Returns:
             Dict with loss and metrics
         """
+        # Use provided model or fall back to self.stage2_model
+        stage2_model = model if model is not None else self.stage2_model
+        
         # Similar to Stage 1 but with RAGAF attention
         # TODO: Implement full Stage 2 training step
         
@@ -357,7 +395,7 @@ class RAGAFDiffusionTrainer:
             )[0].squeeze(0)  # (77, 768)
         
         # Forward through Stage 2
-        output = self.stage2_model(
+        output = stage2_model(
             noisy_latents[:1],  # First item only for simplicity
             timesteps[:1],
             region_graphs[0],
@@ -425,9 +463,26 @@ class RAGAFDiffusionTrainer:
             train_step_fn: Training step function
         """
         # Prepare for distributed training
+        # IMPORTANT: Ensure trainable parameters have requires_grad=True
+        # This is needed because sometimes parameters get their grad disabled
+        for name, p in model.named_parameters():
+            # Only enable grad for UNet and sketch encoder (skip VAE and text_encoder)
+            if 'unet' in name or 'sketch_encoder' in name:
+                p.requires_grad = True
+        
         model, optimizer, train_dataloader, lr_scheduler = self.accelerator.prepare(
             model, optimizer, self.train_dataloader, lr_scheduler
         )
+        
+        print(f"\nDEBUG prepare results:")
+        print(f"  Original model type: {type(model)}")
+        print(f"  Has module attr: {hasattr(model, 'module')}")
+        print(f"  Model training mode: {model.training}")
+        
+        # Check a sample UNet parameter
+        sample_param = next(model.parameters() if not hasattr(model, 'module') else model.module.parameters())
+        print(f"  Sample param requires_grad: {sample_param.requires_grad}")
+        print(f"  Sample param device: {sample_param.device}")
         
         global_step = 0
         
@@ -444,9 +499,16 @@ class RAGAFDiffusionTrainer:
             
             for step, batch in progress_bar:
                 with self.accelerator.accumulate(model):
-                    # Training step
-                    outputs = train_step_fn(batch)
+                    # Training step (pass the wrapped model)
+                    outputs = train_step_fn(batch, model=model)
                     loss = outputs["loss"]
+                    
+                    # Debug logging
+                    if step == 0:
+                        print(f"\nDEBUG - First step:")
+                        print(f"  loss.requires_grad: {loss.requires_grad}")
+                        print(f"  loss.grad_fn: {loss.grad_fn}")
+                        print(f"  model.training: {model.training}")
                     
                     # Backward
                     self.accelerator.backward(loss)
