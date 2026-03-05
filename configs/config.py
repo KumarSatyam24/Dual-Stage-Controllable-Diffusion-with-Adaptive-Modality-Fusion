@@ -48,21 +48,21 @@ class DataConfig:
     
     # Datasets
     dataset_name: str = "sketchy"  # "sketchy", "coco", "both"
-    sketchy_root: str = "/workspace/datasets/sketchy"  # RunPod network volume
-    coco_root: str = "/workspace/datasets/coco"  # RunPod network volume
+    sketchy_root: str = "/workspace/sketchy"  # vast.ai - Google Drive sync destination
+    coco_root: str = "/workspace/coco"  # vast.ai container disk
     
     # Data processing
-    image_size: int = 512
+    image_size: int = 256  # Reduced from 512 → 4x faster, less VRAM, can upscale later
     sketch_method: str = "canny"  # For COCO auto-sketch generation
     
     # Region extraction
     min_region_area: int = 100
-    max_num_regions: int = 50
-    graph_type: str = "hybrid"  # "adjacency", "knn", "radius", "hybrid"
+    max_num_regions: int = 20  # Reduced from 50 → faster graph processing
+    graph_type: str = "adjacency"  # Fastest graph type (was "hybrid")
     
     # Data loading
-    batch_size: int = 4  # Small batch size for memory efficiency
-    num_workers: int = 4
+    batch_size: int = 8  # RTX 5090 32GB - uses ~30GB VRAM, leaves ~2.4GB headroom
+    num_workers: int = 4  # More parallel data loading
     pin_memory: bool = True
     
     # Augmentation
@@ -79,8 +79,8 @@ class TrainingConfig:
     
     # Training stages
     train_stage: str = "both"  # "stage1", "stage2", "both"
-    stage1_epochs: int = 2
-    stage2_epochs: int = 2
+    stage1_epochs: int = 10  # Increased from 2 - more epochs = better quality
+    stage2_epochs: int = 5   # Increased from 2
     
     # Optimization
     learning_rate: float = 1e-4
@@ -95,17 +95,17 @@ class TrainingConfig:
     
     # Gradient
     max_grad_norm: float = 1.0
-    gradient_accumulation_steps: int = 1
+    gradient_accumulation_steps: int = 1  # No accumulation needed with batch_size=4
     
     # Mixed precision
-    mixed_precision: str = "no"  # "no", "fp16", "bf16" - Using "no" to avoid grad scaler issues
+    mixed_precision: str = "bf16"  # bf16 for RTX 5090 - saves ~50% VRAM
     
     # Diffusion
     num_train_timesteps: int = 1000
     noise_scheduler: str = "ddpm"  # "ddpm", "ddim"
     
     # Checkpointing
-    save_every_n_epochs: int = 2
+    save_every_n_epochs: int = 2  # Save every 2 epochs → epoch_2, epoch_4, epoch_6, epoch_8, final
     checkpoint_dir: str = "./checkpoints"
     resume_from_checkpoint: Optional[str] = None
     
