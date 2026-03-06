@@ -22,6 +22,7 @@ import argparse
 from pathlib import Path
 from typing import Dict, Optional
 from tqdm.auto import tqdm
+import shutil
 
 import torch
 import torch.nn.functional as F
@@ -423,7 +424,8 @@ class RAGAFDiffusionTrainer:
                 optimizer=self.optimizer_stage1,
                 lr_scheduler=self.lr_scheduler_stage1,
                 num_epochs=self.training_config.stage1_epochs,
-                train_step_fn=self.train_stage1_step
+                train_step_fn=self.train_stage1_step,
+                start_epoch=self.training_config.resume_from_epoch
             )
         
         # Train Stage 2
@@ -435,7 +437,8 @@ class RAGAFDiffusionTrainer:
                 optimizer=self.optimizer_stage2,
                 lr_scheduler=self.lr_scheduler_stage2,
                 num_epochs=self.training_config.stage2_epochs,
-                train_step_fn=self.train_stage2_step
+                train_step_fn=self.train_stage2_step,
+                start_epoch=0
             )
         
         print("\n" + "="*60)
@@ -449,11 +452,12 @@ class RAGAFDiffusionTrainer:
         optimizer,
         lr_scheduler,
         num_epochs: int,
-        train_step_fn
+        train_step_fn,
+        start_epoch: int = 0
     ):
         """
         Train a single stage.
-        
+
         Args:
             stage: Stage name
             model: Model to train
@@ -461,32 +465,32 @@ class RAGAFDiffusionTrainer:
             lr_scheduler: LR scheduler
             num_epochs: Number of epochs
             train_step_fn: Training step function
+            start_epoch: Epoch to resume from (0-indexed)
         """
         # Prepare for distributed training
-        # IMPORTANT: Ensure trainable parameters have requires_grad=True
-        # This is needed because sometimes parameters get their grad disabled
         for name, p in model.named_parameters():
-            # Only enable grad for UNet and sketch encoder (skip VAE and text_encoder)
             if 'unet' in name or 'sketch_encoder' in name:
                 p.requires_grad = True
-        
+
         model, optimizer, train_dataloader, lr_scheduler = self.accelerator.prepare(
             model, optimizer, self.train_dataloader, lr_scheduler
         )
-        
-        print(f"\nDEBUG prepare results:")
-        print(f"  Original model type: {type(model)}")
-        print(f"  Has module attr: {hasattr(model, 'module')}")
-        print(f"  Model training mode: {model.training}")
-        
-        # Check a sample UNet parameter
-        sample_param = next(model.parameters() if not hasattr(model, 'module') else model.module.parameters())
-        print(f"  Sample param requires_grad: {sample_param.requires_grad}")
-        print(f"  Sample param device: {sample_param.device}")
-        
-        global_step = 0
-        
-        for epoch in range(num_epochs):
+
+        # Resume: load checkpoint weights if start_epoch > 0
+        if start_epoch > 0:
+            resume_path = self._find_resume_checkpoint(stage, start_epoch)
+            if resume_path:
+                print(f"▶️  Resuming from checkpoint: {resume_path}")
+                ckpt = torch.load(resume_path, map_location=self.accelerator.device)
+                unwrapped = self.accelerator.unwrap_model(model)
+                unwrapped.load_state_dict(ckpt["model_state_dict"])
+                print(f"✅ Loaded weights from epoch {ckpt['epoch']+1}")
+            else:
+                print(f"⚠️  No local checkpoint found for epoch {start_epoch}, starting fresh.")
+
+        global_step = start_epoch * len(train_dataloader)
+
+        for epoch in range(start_epoch, num_epochs):
             model.train()
             epoch_loss = 0.0
             
@@ -554,23 +558,51 @@ class RAGAFDiffusionTrainer:
         # Save final checkpoint
         self.save_checkpoint(stage, model, num_epochs, final=True)
     
+    def _find_resume_checkpoint(self, stage: str, start_epoch: int) -> Optional[str]:
+        """Find the best local checkpoint to resume from."""
+        checkpoint_dir = Path(self.training_config.checkpoint_dir) / stage
+        # Look for the checkpoint just before start_epoch
+        for ep in range(start_epoch, 0, -1):
+            path = checkpoint_dir / f"epoch_{ep}.pt"
+            if path.exists():
+                return str(path)
+        return None
+
     def save_checkpoint(self, stage: str, model, epoch: int, final: bool = False):
-        """Save model checkpoint."""
+        """
+        Save model checkpoint locally, upload to HuggingFace Hub, then delete local copy.
+        This keeps disk usage low (~1.5 GB per checkpoint instead of 4.5 GB).
+        """
         if not self.accelerator.is_main_process:
             return
-        
+
+        # Check free disk space before saving (need at least 2 GB)
+        import shutil
         checkpoint_dir = Path(self.training_config.checkpoint_dir) / stage
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        
+        free_bytes = shutil.disk_usage(str(checkpoint_dir)).free
+        free_gb = free_bytes / 1e9
+        print(f"💾 Disk free before checkpoint: {free_gb:.1f} GB")
+        if free_gb < 2.0:
+            print(f"⚠️  Low disk space ({free_gb:.1f} GB). Attempting cleanup before saving...")
+            # Remove any previous local checkpoints for this stage to free space
+            for old_ckpt in checkpoint_dir.glob("epoch_*.pt"):
+                old_ckpt.unlink()
+                print(f"  Removed old local checkpoint: {old_ckpt.name}")
+            free_bytes = shutil.disk_usage(str(checkpoint_dir)).free
+            free_gb = free_bytes / 1e9
+            print(f"  Disk free after cleanup: {free_gb:.1f} GB")
+
         if final:
-            path = checkpoint_dir / "final.pt"
+            filename = "final.pt"
         else:
-            path = checkpoint_dir / f"epoch_{epoch+1}.pt"
-        
-        # Unwrap model
+            filename = f"epoch_{epoch+1}.pt"
+
+        path = checkpoint_dir / filename
+
+        # Unwrap model — save ONLY model weights (not optimizer) to save ~60% space
         unwrapped_model = self.accelerator.unwrap_model(model)
-        
-        torch.save({
+        checkpoint_data = {
             "epoch": epoch,
             "model_state_dict": unwrapped_model.state_dict(),
             "config": {
@@ -578,9 +610,54 @@ class RAGAFDiffusionTrainer:
                 "data": vars(self.data_config),
                 "training": vars(self.training_config)
             }
-        }, path)
-        
-        print(f"Checkpoint saved: {path}")
+        }
+
+        # Save to a temp file first, then rename (avoids corrupt partial writes)
+        tmp_path = path.with_suffix(".tmp")
+        try:
+            torch.save(checkpoint_data, tmp_path)
+            tmp_path.rename(path)
+            saved_size_gb = path.stat().st_size / 1e9
+            print(f"✅ Checkpoint saved locally: {path} ({saved_size_gb:.2f} GB)")
+        except Exception as e:
+            if tmp_path.exists():
+                tmp_path.unlink()
+            print(f"❌ Failed to save checkpoint: {e}")
+            return
+
+        # --- HuggingFace Hub upload, then delete local copy ---
+        if getattr(self.training_config, "push_to_hub", False):
+            try:
+                from huggingface_hub import HfApi, create_repo
+                token = getattr(self.training_config, "hub_token", None) or os.getenv("HF_TOKEN")
+                repo_id = self.training_config.hub_repo_id
+                api = HfApi(token=token)
+
+                # Create repo if it doesn't exist
+                try:
+                    create_repo(repo_id, repo_type="model", private=True, token=token, exist_ok=True)
+                except Exception:
+                    pass
+
+                # Upload checkpoint file
+                hub_path = f"{stage}/{filename}"
+                print(f"☁️  Uploading to HF Hub: {repo_id}/{hub_path} ...")
+                api.upload_file(
+                    path_or_fileobj=str(path),
+                    path_in_repo=hub_path,
+                    repo_id=repo_id,
+                    repo_type="model",
+                    commit_message=f"[{stage}] {'Final' if final else f'Epoch {epoch+1}'} checkpoint"
+                )
+                print(f"✅ Uploaded to HF Hub: https://huggingface.co/{repo_id}")
+
+                # Keep local copy AND HF Hub copy (114 GB free on disk)
+                print(f"✅ Checkpoint saved both locally ({path}) and on HF Hub.")
+
+            except Exception as e:
+                print(f"⚠️  HF Hub upload failed — keeping local copy: {e}")
+        else:
+            print("ℹ️  push_to_hub=False, checkpoint kept locally only.")
 
 
 def main():
@@ -592,6 +669,8 @@ def main():
     parser.add_argument("--learning_rate", type=float, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--checkpoint_dir", type=str, default=None)
+    parser.add_argument("--resume_epoch", type=int, default=0,
+                        help="Resume stage1 training from this epoch (e.g. 4 to skip epochs 1-4)")
     
     args = parser.parse_args()
     
@@ -615,6 +694,9 @@ def main():
         config["training"].stage2_epochs = args.epochs
     if args.checkpoint_dir is not None:
         config["training"].checkpoint_dir = args.checkpoint_dir
+    if args.resume_epoch > 0:
+        config["training"].resume_from_epoch = args.resume_epoch
+        print(f"▶️  Will resume Stage 1 from epoch {args.resume_epoch}")
     
     # Create trainer
     trainer = RAGAFDiffusionTrainer(

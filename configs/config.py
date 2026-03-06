@@ -61,7 +61,7 @@ class DataConfig:
     graph_type: str = "adjacency"  # Fastest graph type (was "hybrid")
     
     # Data loading
-    batch_size: int = 8  # RTX 5090 32GB - uses ~30GB VRAM, leaves ~2.4GB headroom
+    batch_size: int = 4  # Safe for RTX 5090 32GB (~31GB VRAM, ~1.6GB headroom)
     num_workers: int = 4  # More parallel data loading
     pin_memory: bool = True
     
@@ -106,8 +106,14 @@ class TrainingConfig:
     
     # Checkpointing
     save_every_n_epochs: int = 2  # Save every 2 epochs → epoch_2, epoch_4, epoch_6, epoch_8, final
-    checkpoint_dir: str = "./checkpoints"
+    checkpoint_dir: str = "/root/checkpoints"  # 114 GB free on root filesystem
     resume_from_checkpoint: Optional[str] = None
+    resume_from_epoch: int = 0  # Set to N to resume training from epoch N
+
+    # HuggingFace Hub auto-upload (never lose checkpoints again)
+    push_to_hub: bool = True
+    hub_repo_id: str = "DrRORAL/ragaf-diffusion-checkpoints"  # Will be created if not exists
+    hub_token: Optional[str] = None  # Uses HF_TOKEN env var if None
     
     # Logging
     log_every_n_steps: int = 10

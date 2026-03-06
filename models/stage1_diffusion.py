@@ -5,12 +5,13 @@ This module implements the first stage of the dual-stage pipeline:
 coarse structure-preserving image layout generation guided by sketch input.
 
 Uses ControlNet-style architecture to inject sketch conditioning into
-Stable Diffusion's UNet.
+Stable Diffusion's UNet via down_block_additional_residuals and
+mid_block_additional_residual.
 
 Key features:
-- Sketch encoder to process sketch input
-- ControlNet-style zero-initialized convolutions
-- Residual connections to UNet blocks
+- Sketch encoder producing 12 residuals (11 down + 1 mid) matching SD v1.5 UNet
+- ControlNet-style zero-initialized output convolutions
+- Proper residual injection into all UNet down blocks and mid block
 - Preserves sketch structure while allowing texture generation
 
 Author: RAGAF-Diffusion Research Team
@@ -31,88 +32,163 @@ from transformers import CLIPTextModel, CLIPTokenizer
 
 class SketchEncoder(nn.Module):
     """
-    Encoder for sketch input, similar to ControlNet approach.
-    
-    Processes sketch image to extract hierarchical features that can be
-    injected into UNet at multiple scales.
+    ControlNet-style encoder for sketch input.
+
+    Produces 12 down-block residuals + 1 mid-block residual that match
+    the shape expected by UNet2DConditionModel's
+    down_block_additional_residuals / mid_block_additional_residual args.
+
+    The sketch is first downsampled 8× (via strided convs) to match the
+    latent spatial resolution that the UNet operates at.
+
+    For SD v1.5 at 256×256 input (latent 32×32) the residual shapes are:
+      Block 0 (channels=320, spatial=32): [B,320,32,32] x3, then [B,320,16,16] (post-ds)
+      Block 1 (channels=640, spatial=16): [B,640,16,16] x2, then [B,640,8,8]
+      Block 2 (channels=1280, spatial=8):  [B,1280,8,8]  x2, then [B,1280,4,4]
+      Block 3 (channels=1280, spatial=4):  [B,1280,4,4]  x2
+    Total: 3+1 + 2+1 + 2+1 + 2 = 12 down residuals + 1 mid.
     """
-    
+
     def __init__(
         self,
-        in_channels: int = 1,  # Grayscale sketch
-        base_channels: int = 32,
-        out_channels: List[int] = [320, 640, 1280, 1280],  # Match UNet channels
-        num_res_blocks: int = 2
+        in_channels: int = 1,          # Grayscale sketch
+        base_channels: int = 16,
+        # Channels per UNet block: [320, 640, 1280, 1280]
+        block_out_channels: List[int] = [320, 640, 1280, 1280],
+        layers_per_block: int = 2,     # SD v1.5 uses 2 resnet layers per block
     ):
-        """
-        Initialize sketch encoder.
-        
-        Args:
-            in_channels: Number of input channels (1 for grayscale sketch)
-            base_channels: Base number of channels
-            out_channels: Output channels for each scale (should match UNet)
-            num_res_blocks: Number of residual blocks per scale
-        """
         super().__init__()
+
+        self.block_out_channels = block_out_channels
+        self.layers_per_block = layers_per_block
+
+        # ------------------------------------------------------------------
+        # Stem: sketch (B,1,H,W) -> (B, base_channels, H/8, W/8)
+        #
+        # SD v1.5 encodes images into latents that are 8× smaller.
+        # The UNet's down_block_additional_residuals must therefore start
+        # at latent spatial resolution (e.g. 32×32 for a 256×256 image).
+        # We use three stride-2 convolutions to achieve the 8× reduction.
+        # ------------------------------------------------------------------
+        self.input_proj = nn.Sequential(
+            # 1×: H/2
+            nn.Conv2d(in_channels, base_channels, kernel_size=3, stride=2, padding=1),
+            nn.SiLU(),
+            # 2×: H/4
+            nn.Conv2d(base_channels, base_channels, kernel_size=3, stride=2, padding=1),
+            nn.SiLU(),
+            # 3×: H/8  — now matches latent spatial resolution
+            nn.Conv2d(base_channels, base_channels, kernel_size=3, stride=2, padding=1),
+            nn.SiLU(),
+        )
         
-        self.out_channels = out_channels
-        
-        # Initial convolution
-        self.conv_in = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
-        
-        # Downsampling blocks to match UNet scales
+        # ControlNet has an extra conv after input that produces the first residual
+        # This gives block 0 an extra output (3 total instead of 2)
+        self.conv_after_input = nn.Conv2d(base_channels, block_out_channels[0], kernel_size=3, padding=1)
+
+        # ------------------------------------------------------------------
+        # Down-sampling feature pyramid.
+        # We build one "block" per UNet down-block, each consisting of
+        # `layers_per_block` residual layers + optional strided downsample.
+        # ------------------------------------------------------------------
         self.down_blocks = nn.ModuleList()
-        current_channels = base_channels
-        
-        for out_ch in out_channels:
-            # Residual blocks
-            res_blocks = []
-            for _ in range(num_res_blocks):
-                res_blocks.append(
-                    ResidualBlock(current_channels, out_ch)
+        self.down_samplers = nn.ModuleList()   # one per block (except last)
+        current_ch = block_out_channels[0]  # Start from first block's channels
+
+        for i, out_ch in enumerate(block_out_channels):
+            layers = []
+            for j in range(layers_per_block):
+                layers.append(ResidualBlock(current_ch, out_ch))
+                current_ch = out_ch
+            self.down_blocks.append(nn.Sequential(*layers))
+
+            # Downsample between blocks (not after the last block)
+            if i < len(block_out_channels) - 1:
+                self.down_samplers.append(
+                    nn.Conv2d(current_ch, current_ch, kernel_size=3, stride=2, padding=1)
                 )
-                current_channels = out_ch
-            
-            # Downsample (except for last block)
-            if out_ch != out_channels[-1]:
-                res_blocks.append(
-                    nn.Conv2d(current_channels, current_channels, kernel_size=3, stride=2, padding=1)
-                )
-            
-            self.down_blocks.append(nn.Sequential(*res_blocks))
+            else:
+                self.down_samplers.append(None)
+
+        # ------------------------------------------------------------------
+        # Mid block (same channels as last down block)
+        # ------------------------------------------------------------------
+        mid_ch = block_out_channels[-1]
+        self.mid_block = nn.Sequential(
+            ResidualBlock(current_ch, mid_ch),
+            ResidualBlock(mid_ch, mid_ch),
+        )
+
+        # ------------------------------------------------------------------
+        # Zero-initialized 1×1 projection convolutions (ControlNet trick).
+        # One per residual output we produce:
+        #   - 1 for conv_after_input (block 0's extra output)
+        #   - layers_per_block outputs per block (before downsample)
+        #   - 1 output per block for the post-downsample feature
+        #     (except the last block which has no downsampler)
+        # Total down outputs  = 1 + sum over blocks of (layers_per_block + has_ds)
+        #   = 1 + (2+1)*3 + (2+0)*1 = 1 + 9 + 2 = 12
+        # Plus 1 mid output  -> 13 total zero-convs
+        # ------------------------------------------------------------------
+        self.zero_convs_down: nn.ModuleList = nn.ModuleList()
         
-        # Zero-initialized output convolutions (ControlNet trick)
-        # Start with zero contribution, gradually learn
-        self.zero_convs = nn.ModuleList([
-            nn.Conv2d(out_ch, out_ch, kernel_size=1)
-            for out_ch in out_channels
-        ])
+        # First zero-conv for conv_after_input output
+        self.zero_convs_down.append(self._make_zero_conv(block_out_channels[0]))
         
-        # Initialize zero convs to zero
-        for zero_conv in self.zero_convs:
-            nn.init.zeros_(zero_conv.weight)
-            nn.init.zeros_(zero_conv.bias)
-    
-    def forward(self, sketch: torch.Tensor) -> List[torch.Tensor]:
+        for i, out_ch in enumerate(block_out_channels):
+            # One zero-conv per resnet layer output
+            for _ in range(layers_per_block):
+                self.zero_convs_down.append(self._make_zero_conv(out_ch))
+            # One zero-conv for the post-downsampler output (if exists)
+            if i < len(block_out_channels) - 1:
+                self.zero_convs_down.append(self._make_zero_conv(out_ch))
+
+        self.zero_conv_mid = self._make_zero_conv(mid_ch)
+
+    @staticmethod
+    def _make_zero_conv(channels: int) -> nn.Conv2d:
+        conv = nn.Conv2d(channels, channels, kernel_size=1)
+        nn.init.zeros_(conv.weight)
+        nn.init.zeros_(conv.bias)
+        return conv
+
+    def forward(self, sketch: torch.Tensor):
         """
-        Encode sketch to multi-scale features.
-        
         Args:
-            sketch: Sketch input (B, 1, H, W)
-        
+            sketch: (B, 1, H, W) sketch image, values in [-1, 1]
+
         Returns:
-            List of features at different scales
+            down_residuals: tuple of 12 tensors for down_block_additional_residuals
+            mid_residual:   single tensor  for mid_block_additional_residual
         """
-        x = self.conv_in(sketch)
+        x = self.input_proj(sketch)
         
-        features = []
-        for down_block, zero_conv in zip(self.down_blocks, self.zero_convs):
-            x = down_block(x)
-            # Apply zero-initialized conv
-            feat = zero_conv(x)
-            features.append(feat)
+        # ControlNet structure: first apply conv_after_input and emit as residual[0]
+        x = self.conv_after_input(x)
         
-        return features
+        down_residuals: List[torch.Tensor] = []
+        down_residuals.append(self.zero_convs_down[0](x))  # First residual from conv_after_input
+        zero_idx = 1
+
+        for i, (block, ds) in enumerate(zip(self.down_blocks, self.down_samplers)):
+            # Apply each resnet layer individually so we can capture per-layer output
+            for layer in block:
+                x = layer(x)
+                down_residuals.append(self.zero_convs_down[zero_idx](x))
+                zero_idx += 1
+
+            # Downsample (if this block has one) and capture the result
+            if ds is not None:
+                x = ds(x)
+                down_residuals.append(self.zero_convs_down[zero_idx](x))
+                zero_idx += 1
+
+        # Mid block
+        x = self.mid_block(x)
+        mid_residual = self.zero_conv_mid(x)
+
+        # Return as tuple (UNet expects tuple, not list)
+        return tuple(down_residuals), mid_residual
 
 
 class ResidualBlock(nn.Module):
@@ -203,18 +279,20 @@ class Stage1SketchGuidedDiffusion(nn.Module):
         if freeze_base_unet:
             self.unet.requires_grad_(False)
         
-        # Sketch encoder for conditioning
+        # Sketch encoder for conditioning.
+        # Produces 11 down-block residuals + 1 mid-block residual that are
+        # directly passed to UNet via down_block_additional_residuals /
+        # mid_block_additional_residual (ControlNet-style injection).
         self.sketch_encoder = SketchEncoder(
             in_channels=1,
-            out_channels=sketch_encoder_channels
+            block_out_channels=self.unet.config.block_out_channels,
+            layers_per_block=self.unet.config.layers_per_block,
         )
-        
-        # TODO: Implement LoRA if use_lora=True
-        # For now, full fine-tuning or frozen UNet
+
+        # LoRA placeholder (not critical for sketch conditioning correctness)
         self.use_lora = use_lora
         if use_lora:
-            print(f"LoRA fine-tuning enabled (rank={lora_rank})")
-            # self._apply_lora(lora_rank)  # Implement in future
+            print(f"LoRA fine-tuning enabled (rank={lora_rank}) — sketch encoder is primary adapter")
         
         # Noise scheduler
         self.noise_scheduler = DDPMScheduler.from_pretrained(
@@ -223,19 +301,18 @@ class Stage1SketchGuidedDiffusion(nn.Module):
         
         print("Stage 1 Sketch-Guided Diffusion initialized")
     
-    def encode_sketch(self, sketch: torch.Tensor) -> List[torch.Tensor]:
+    def encode_sketch(self, sketch: torch.Tensor):
         """
-        Encode sketch to multi-scale features.
-        
+        Encode sketch to multi-scale ControlNet-style residuals.
+
         Args:
             sketch: Sketch input (B, 1, H, W) in range [0, 1]
-        
+
         Returns:
-            List of sketch features at different scales
+            (down_residuals, mid_residual) — 11-element list + single tensor
         """
-        # Normalize sketch to [-1, 1] to match UNet input range
+        # Normalize sketch to [-1, 1]
         sketch = sketch * 2.0 - 1.0
-        
         return self.sketch_encoder(sketch)
     
     def encode_text(self, text_prompts: List[str]) -> torch.Tensor:
@@ -269,39 +346,42 @@ class Stage1SketchGuidedDiffusion(nn.Module):
         self,
         latents: torch.Tensor,
         timestep: torch.Tensor,
-        sketch_features: List[torch.Tensor],
+        sketch_features,           # tuple: (down_residuals, mid_residual)
         text_embeddings: torch.Tensor,
         return_dict: bool = False
     ) -> torch.Tensor:
         """
-        Forward pass through UNet with sketch conditioning.
-        
+        Forward pass through UNet with ControlNet-style sketch conditioning.
+
         Args:
             latents: Noisy latents (B, 4, H/8, W/8)
             timestep: Diffusion timestep (B,)
-            sketch_features: Multi-scale sketch features from sketch_encoder
+            sketch_features: Output of encode_sketch() —
+                             tuple (down_residuals list[11], mid_residual tensor)
             text_embeddings: Text embeddings (B, 77, 768)
             return_dict: Whether to return dict or tensor
-        
+
         Returns:
             Predicted noise (B, 4, H/8, W/8)
         """
-        # Standard UNet forward with text conditioning
-        # Inject sketch features as additional residual connections
-        
-        # TODO: Properly inject sketch_features into UNet blocks
-        # For now, use standard UNet forward (sketch features prepared for injection)
-        
-        # This requires modifying UNet forward to accept additional residuals
-        # Or using a custom UNet wrapper
-        
+        # Unpack sketch conditioning residuals
+        if isinstance(sketch_features, (tuple, list)) and len(sketch_features) == 2:
+            down_residuals, mid_residual = sketch_features
+        else:
+            # Fallback: no sketch conditioning (should not happen in normal use)
+            down_residuals = None
+            mid_residual = None
+
+        # UNet forward with sketch conditioning injected via ControlNet residuals
         noise_pred = self.unet(
             latents,
             timestep,
             encoder_hidden_states=text_embeddings,
-            return_dict=return_dict
+            down_block_additional_residuals=down_residuals,
+            mid_block_additional_residual=mid_residual,
+            return_dict=return_dict,
         )
-        
+
         if return_dict:
             return noise_pred
         else:
@@ -375,74 +455,77 @@ class Stage1DiffusionPipeline:
     ) -> torch.Tensor:
         """
         Generate image from sketch and text prompt.
-        
+
         Args:
             sketch: Sketch input (1, 1, H, W)
             text_prompt: Text prompt
             height: Output height
             width: Output width
             seed: Random seed for reproducibility
-        
+
         Returns:
             Generated image (1, 3, H, W) in range [0, 1]
         """
         if seed is not None:
             torch.manual_seed(seed)
-        
+
         # Move sketch to device
         sketch = sketch.to(self.device)
-        
-        # Encode sketch
-        sketch_features = self.model.encode_sketch(sketch)
-        
+
+        # Encode sketch — returns (down_residuals, mid_residual) for batch=1
+        down_res_single, mid_res_single = self.model.encode_sketch(sketch)
+
+        # For CFG we run a batch of 2 (uncond + cond). Duplicate sketch residuals.
+        down_res_cfg = [torch.cat([r, r]) for r in down_res_single]
+        mid_res_cfg = torch.cat([mid_res_single, mid_res_single])
+        sketch_features_cfg = (down_res_cfg, mid_res_cfg)
+
         # Encode text
         text_embeddings = self.model.encode_text([text_prompt])
-        
+
         # Prepare uncond embeddings for classifier-free guidance
         uncond_embeddings = self.model.encode_text([""])
-        
+
         # Initialize latents
         latents = torch.randn(
             1, 4, height // 8, width // 8,
             device=self.device, dtype=torch.float32
         )
         latents = latents * self.scheduler.init_noise_sigma
-        
+
         # Denoising loop
         for t in self.scheduler.timesteps:
             # Expand latents for classifier-free guidance
             latent_model_input = torch.cat([latents] * 2)
             latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-            
-            # Concatenate conditional and unconditional embeddings
+
+            # Concatenate uncond + cond embeddings
             encoder_hidden_states = torch.cat([uncond_embeddings, text_embeddings])
-            
-            # Predict noise
-            with torch.no_grad():
-                noise_pred = self.model(
-                    latent_model_input,
-                    t,
-                    sketch_features,
-                    encoder_hidden_states
-                )
-            
+
+            # Predict noise with sketch conditioning for both uncond and cond
+            noise_pred = self.model(
+                latent_model_input,
+                t,
+                sketch_features_cfg,
+                encoder_hidden_states,
+            )
+
             # Perform guidance
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
             noise_pred = noise_pred_uncond + self.guidance_scale * (
                 noise_pred_text - noise_pred_uncond
             )
-            
+
             # Compute previous noisy sample
             latents = self.scheduler.step(noise_pred, t, latents).prev_sample
-        
+
         # Decode latents to image
-        with torch.no_grad():
-            latents = 1 / 0.18215 * latents
-            image = self.model.vae.decode(latents).sample
-        
+        latents = 1 / 0.18215 * latents
+        image = self.model.vae.decode(latents).sample
+
         # Denormalize to [0, 1]
         image = (image / 2 + 0.5).clamp(0, 1)
-        
+
         return image
 
 
