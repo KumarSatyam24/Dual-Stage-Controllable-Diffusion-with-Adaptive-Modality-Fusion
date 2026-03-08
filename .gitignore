@@ -65,3 +65,27 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# Project specific
+outputs/
+checkpoints/
+data/raw/
+data/processed/
+*.log
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

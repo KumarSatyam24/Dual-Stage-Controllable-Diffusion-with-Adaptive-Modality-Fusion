@@ -32,6 +32,8 @@ tqdm>=4.65.0
 pyyaml>=6.0
 einops>=0.6.0
 
+seaborn
+
 # Optional (can install later if needed)
 # xformers>=0.0.20  # For efficient attention (requires CUDA)
 # peft>=0.4.0  # For LoRA adapters
