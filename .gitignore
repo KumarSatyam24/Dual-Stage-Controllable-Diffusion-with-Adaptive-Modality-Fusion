@@ -89,3 +89,30 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+
+# ==============================
+# ML / Training artifacts
+# ==============================
+experiments/
+validation_results/
+validation_examples/
+wandb/
+logs/
+# Tensorboard
+tensorboard/
+events.out.tfevents*
+
+# PyTorch / CUDA
+*.bin
+
+# HuggingFace
+cache/
+hf_cache/
+
+# Dataset caches
+*.arrow
+*.parquet
+
+# Mac/Linux temp
+*.DS_Store
