@@ -346,19 +346,19 @@ if __name__ == "__main__":
     print("- Timestep-adaptive fusion weights")
     print("- Structure preservation from Stage 1")
     
-    # # Uncomment to test with actual UNet (requires GPU)
-    # from diffusers import UNet2DConditionModel
-    # 
-    # unet = UNet2DConditionModel.from_pretrained(
-    #     "runwayml/stable-diffusion-v1-5",
-    #     subfolder="unet"
-    # )
-    # 
-    # stage2 = Stage2SemanticRefinement(
-    #     unet=unet,
-    #     node_feature_dim=6,
-    #     text_dim=768,
-    #     hidden_dim=512
-    # )
-    # 
-    # print(f"\nTrainable parameters: {sum(p.numel() for p in stage2.get_trainable_parameters()):,}")
+     # Uncomment to test with actual UNet (requires GPU)
+     from diffusers import UNet2DConditionModel
+     
+     unet = UNet2DConditionModel.from_pretrained(
+         "runwayml/stable-diffusion-v1-5",
+         subfolder="unet"
+     )
+     
+     stage2 = Stage2SemanticRefinement(
+         unet=unet,
+         node_feature_dim=6,
+         text_dim=768,
+         hidden_dim=512
+     )
+     
+     print(f"\nTrainable parameters: {sum(p.numel() for p in stage2.get_trainable_parameters()):,}")

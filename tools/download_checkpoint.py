@@ -4,12 +4,12 @@ from huggingface_hub import hf_hub_download
 import os
 
 repo_id = "DrRORAL/ragaf-diffusion-checkpoints"
-filename = "stage1_improved/epoch_12.pt"
+filename = "stage1_with_ssim/epoch_18.pt"
 
 print(f"📥 Downloading {filename} from HuggingFace...")
 
 # Create directory
-os.makedirs("/root/checkpoints/stage1_improved", exist_ok=True)
+os.makedirs("/root/checkpoints/stage1_with_ssim", exist_ok=True)
 
 # Download
 local_path = hf_hub_download(

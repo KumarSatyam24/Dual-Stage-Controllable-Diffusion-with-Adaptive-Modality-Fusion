@@ -15,8 +15,9 @@ def load_checkpoint(checkpoint_path: str):
     """Load model from checkpoint."""
     print(f"Loading checkpoint from: {checkpoint_path}")
     
-    # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    # Load checkpoint (weights_only=False to allow full checkpoint with custom objects)
+    # NOTE: only do this for trusted checkpoints as it can execute arbitrary code during unpickling.
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     
     # Create model
     model = Stage1SketchGuidedDiffusion(
@@ -95,10 +96,24 @@ def test_sketch_encoding(model, sketch_path: str = None, device='cuda'):
     
     with torch.no_grad():
         sketch_features = model.encode_sketch(sketch_tensor)
-        
+
         print(f"✅ Encoded sketch to {len(sketch_features)} feature levels:")
         for i, feat in enumerate(sketch_features):
-            print(f"   Level {i}: {feat.shape}, mean={feat.mean():.4f}, std={feat.std():.4f}")
+            # Some implementations return tuples like (tensor, aux) per level. Extract tensor if needed.
+            t = None
+            if isinstance(feat, (tuple, list)):
+                for el in feat:
+                    if isinstance(el, torch.Tensor):
+                        t = el
+                        break
+            elif isinstance(feat, torch.Tensor):
+                t = feat
+
+            if t is None:
+                # Fallback: print repr
+                print(f"   Level {i}: (non-tensor output) {type(feat)}")
+            else:
+                print(f"   Level {i}: {t.shape}, mean={t.mean():.4f}, std={t.std():.4f}")
     
     return True
 

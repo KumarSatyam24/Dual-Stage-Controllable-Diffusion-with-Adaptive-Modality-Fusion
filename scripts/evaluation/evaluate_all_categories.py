@@ -18,6 +18,7 @@ sys.path.insert(0, '/root/Dual-Stage-Controllable-Diffusion-with-Adaptive-Modali
 from models.stage1_diffusion import Stage1SketchGuidedDiffusion, Stage1DiffusionPipeline
 from configs.config import get_default_config
 from huggingface_hub import hf_hub_download
+import argparse
 
 # Dataset path - correct structure: sketchy/sketch/tx_000000000000/<category>/*.png
 DATASET_PATH = "/workspace/sketchy/sketch/tx_000000000000"
@@ -186,18 +187,35 @@ def main():
         print("❌ No categories found! Check dataset path.")
         return
     
-    # Download checkpoint
-    print("\n📥 Downloading final checkpoint...")
-    try:
-        checkpoint_path = hf_hub_download(
-            repo_id="DrRORAL/ragaf-diffusion-checkpoints",
-            filename="stage1/final.pt",
-            cache_dir="/root/.cache/huggingface",
-        )
-        print(f"✅ Checkpoint ready: {checkpoint_path}")
-    except Exception as e:
-        print(f"❌ Failed to download checkpoint: {e}")
-        return
+    # Parse CLI args (allow specifying local checkpoint or HF repo+filename)
+    parser = argparse.ArgumentParser(description="Evaluate Stage 1 checkpoint on all categories")
+    parser.add_argument('--local-checkpoint', type=str, default=None,
+                        help='Path to a local checkpoint file (.pt) to use instead of downloading')
+    parser.add_argument('--repo-id', type=str, default='DrRORAL/ragaf-diffusion-checkpoints',
+                        help='Hugging Face repo id to download from')
+    parser.add_argument('--filename', type=str, default='stage1/final.pt',
+                        help='Filename in the HF repo to download (e.g., stage1/epoch_12.pt)')
+    args = parser.parse_args()
+
+    # Determine checkpoint path: local file preferred, else download from HF
+    if args.local_checkpoin t:
+        checkpoint_path = args.local_checkpoint
+        if not os.path.exists(checkpoint_path):
+            print(f"❌ Local checkpoint not found: {checkpoint_path}")
+            return
+        print(f"📦 Using local checkpoint: {checkpoint_path}")
+    else:
+        print("\n📥 Downloading checkpoint from Hugging Face Hub...")
+        try:
+            checkpoint_path = hf_hub_download(
+                repo_id=args.repo_id,
+                filename=args.filename,
+                cache_dir="/root/.cache/huggingface",
+            )
+            print(f"✅ Checkpoint ready: {checkpoint_path}")
+        except Exception as e:
+            print(f"❌ Failed to download checkpoint: {e}")
+            return
     
     # Load model
     model, pipeline = load_model(checkpoint_path, device)
