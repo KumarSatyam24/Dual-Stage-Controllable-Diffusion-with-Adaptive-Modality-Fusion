@@ -61,8 +61,8 @@ class DataConfig:
     graph_type: str = "adjacency"  # Fastest graph type (was "hybrid")
     
     # Data loading
-    batch_size: int = 4  # Safe for RTX 5090 32GB (~31GB VRAM, ~1.6GB headroom)
-    num_workers: int = 4  # More parallel data loading
+    batch_size: int = 4  # Reduced to 2 to fit in 32GB VRAM (Stage 2 model is large)
+    num_workers: int = 0  # Disabled multiprocessing to avoid connection errors
     pin_memory: bool = True
     
     # Augmentation
@@ -78,7 +78,7 @@ class TrainingConfig:
     """Training procedure configuration."""
     
     # Training stages
-    train_stage: str = "both"  # "stage1", "stage2", "both"
+    train_stage: str = "stage2"  # "stage1", "stage2", "both" - Changed to stage2-only (Stage 1 already trained to epoch 18)
     stage1_epochs: int = 10  # Increased from 2 - more epochs = better quality
     stage2_epochs: int = 5   # Increased from 2
     
@@ -95,10 +95,10 @@ class TrainingConfig:
     
     # Gradient
     max_grad_norm: float = 1.0
-    gradient_accumulation_steps: int = 1  # No accumulation needed with batch_size=4
+    gradient_accumulation_steps: int = 3  # Accumulate 3 steps: effective batch_size = 2*3 = 6
     
     # Mixed precision
-    mixed_precision: str = "bf16"  # bf16 for RTX 5090 - saves ~50% VRAM
+    mixed_precision: str = "no"  # Disable mixed precision for faster GPU utilization (use fp32)
     
     # Diffusion
     num_train_timesteps: int = 1000

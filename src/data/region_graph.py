@@ -17,7 +17,7 @@ from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass
 from scipy.spatial.distance import cdist
 
-from data.region_extraction import SketchRegion
+from .region_extraction import SketchRegion
 
 
 @dataclass

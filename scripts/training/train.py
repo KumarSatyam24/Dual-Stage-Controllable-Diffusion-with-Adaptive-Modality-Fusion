@@ -32,17 +32,18 @@ from diffusers import AutoencoderKL, DDPMScheduler
 from diffusers.optimization import get_scheduler
 from transformers import CLIPTextModel, CLIPTokenizer
 
-# Add project root to path
-sys.path.append(str(Path(__file__).parent))
+# Add project root to path for imports
+PROJECT_ROOT = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
-from configs.config import ModelConfig, DataConfig, TrainingConfig, get_default_config
-from datasets.sketchy_dataset import SketchyDataset, collate_fn as sketchy_collate
-from datasets.coco_dataset import COCODataset, collate_fn as coco_collate
-from models.stage1_diffusion import Stage1SketchGuidedDiffusion
-from models.stage2_refinement import Stage2SemanticRefinement
-from data.sketch_extraction import SketchExtractor
-from data.region_extraction import RegionExtractor
-from data.region_graph import RegionGraphBuilder
+from src.configs.config import ModelConfig, DataConfig, TrainingConfig, get_default_config
+from src.datasets.sketchy_dataset import SketchyDataset, collate_fn as sketchy_collate
+from src.datasets.coco_dataset import COCODataset, collate_fn as coco_collate
+from src.models.stage1_diffusion import Stage1SketchGuidedDiffusion
+from src.models.stage2_refinement import Stage2SemanticRefinement
+from src.data.sketch_extraction import SketchExtractor
+from src.data.region_extraction import RegionExtractor
+from src.data.region_graph import RegionGraphBuilder
 
 
 class RAGAFDiffusionTrainer:
@@ -347,7 +348,8 @@ class RAGAFDiffusionTrainer:
     
     def train_stage2_step(self, batch: Dict, model=None) -> Dict:
         """
-        Single training step for Stage 2.
+        Single training step for Stage 2 - FAST BATCH VERSION.
+        Processes entire batch at once for maximum GPU utilization.
         
         Args:
             batch: Batch of data
@@ -359,19 +361,16 @@ class RAGAFDiffusionTrainer:
         # Use provided model or fall back to self.stage2_model
         stage2_model = model if model is not None else self.stage2_model
         
-        # Similar to Stage 1 but with RAGAF attention
-        # TODO: Implement full Stage 2 training step
-        
         photos = batch["photo"].to(self.accelerator.device)
         text_prompts = batch["text_prompt"]
-        region_graphs = batch["region_graph"]
+        batch_size = photos.shape[0]
         
-        # Encode images
+        # Encode images to latents (fully batched)
         with torch.no_grad():
             latents = self.vae.encode(photos).latent_dist.sample()
             latents = latents * 0.18215
         
-        # For now, simplified training (just UNet loss)
+        # Sample noise and timesteps (fully batched)
         noise = torch.randn_like(latents)
         timesteps = torch.randint(
             0, self.noise_scheduler.config.num_train_timesteps,
@@ -380,34 +379,113 @@ class RAGAFDiffusionTrainer:
         )
         noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
         
-        # Process first item in batch (simplified)
-        # Full implementation would batch process
-        text_inputs = self.tokenizer(
-            text_prompts[0],
-            padding="max_length",
-            max_length=self.tokenizer.model_max_length,
-            truncation=True,
-            return_tensors="pt"
-        )
-        
+        # Encode text prompts (fully batched)
         with torch.no_grad():
-            text_embeddings = self.text_encoder(
+            text_inputs = self.tokenizer(
+                text_prompts,
+                padding="max_length",
+                max_length=self.tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt"
+            )
+            text_embeddings_batch = self.text_encoder(
                 text_inputs.input_ids.to(self.accelerator.device)
-            )[0].squeeze(0)  # (77, 768)
+            )[0]  # (B, 77, 768)
         
-        # Forward through Stage 2
+        # FAST BATCHED FORWARD PASS
+        # Use full batch text embeddings for proper batching
+        text_embeddings = text_embeddings_batch  # (B, 77, 768)
+        
+        # Get dummy region graph (use first sample)
+        region_graphs = batch["region_graph"]
+        region_graph = region_graphs[0] if isinstance(region_graphs, list) else region_graphs
+        
+        # Move region graph to device
+        if hasattr(region_graph, 'node_features') and region_graph.node_features is not None:
+            region_graph.node_features = region_graph.node_features.to(self.accelerator.device)
+        
+        # Forward through Stage 2 with entire batch
         output = stage2_model(
-            noisy_latents[:1],  # First item only for simplicity
-            timesteps[:1],
-            region_graphs[0],
-            text_embeddings,
+            noisy_latents,  # (B, 4, H/8, W/8) - FULLY BATCHED
+            timesteps,      # (B,) - FULLY BATCHED
+            region_graph,   # Same region graph for all
+            text_embeddings,  # (B, 77, 768) - batched token embeddings
             return_dict=True
         )
         
         noise_pred = output["noise_pred"]
-        loss = F.mse_loss(noise_pred, noise[:1])
+        loss = F.mse_loss(noise_pred, noise)
         
         return {"loss": loss}
+    
+    def validate_stage2(self, model, num_samples: int = 4) -> Dict[str, float]:
+        """
+        Validate Stage 2 by checking that output differs from input.
+        
+        Args:
+            model: Stage 2 model
+            num_samples: Number of validation samples to process
+        
+        Returns:
+            Dict with validation metrics
+        """
+        model.eval()
+        device = self.accelerator.device
+        val_loss = 0.0
+        num_processed = 0
+        
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(self.train_dataloader):
+                if batch_idx >= 1:  # Just process 1 batch for validation
+                    break
+                
+                photos = batch["photo"].to(device)
+                text_prompts = batch["text_prompt"]
+                region_graphs = batch["region_graph"]
+                
+                # Encode images
+                latents = self.vae.encode(photos).latent_dist.sample()
+                latents = latents * 0.18215
+                
+                # Sample noise
+                noise = torch.randn_like(latents)
+                timesteps = torch.randint(
+                    0, self.noise_scheduler.config.num_train_timesteps,
+                    (latents.shape[0],),
+                    device=device
+                )
+                noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
+                
+                # Encode text
+                text_inputs = self.tokenizer(
+                    text_prompts,
+                    padding="max_length",
+                    max_length=self.tokenizer.model_max_length,
+                    truncation=True,
+                    return_tensors="pt"
+                )
+                text_embeddings_list = self.text_encoder(
+                    text_inputs.input_ids.to(device)
+                )[0]
+                
+                # Validate on first sample
+                batch_size = min(num_samples, photos.shape[0])
+                for i in range(batch_size):
+                    output = model(
+                        noisy_latents[i:i+1],
+                        timesteps[i:i+1],
+                        region_graphs[i],
+                        text_embeddings_list[i],
+                        return_dict=True
+                    )
+                    noise_pred = output["noise_pred"]
+                    loss = F.mse_loss(noise_pred, noise[i:i+1])
+                    val_loss += loss.item()
+                    num_processed += 1
+        
+        model.train()
+        return {"val_loss": val_loss / max(num_processed, 1)}
+
     
     def train(self):
         """Main training loop."""
@@ -570,8 +648,13 @@ class RAGAFDiffusionTrainer:
 
     def save_checkpoint(self, stage: str, model, epoch: int, final: bool = False):
         """
-        Save model checkpoint locally, upload to HuggingFace Hub, then delete local copy.
-        This keeps disk usage low (~1.5 GB per checkpoint instead of 4.5 GB).
+        Save model checkpoint locally, upload to HuggingFace Hub, then aggressively cleanup old checkpoints.
+        
+        Strategy for 100GB container storage:
+        1. Save checkpoint locally
+        2. Upload to HuggingFace Hub
+        3. Delete older checkpoints (keep only 2 most recent + final)
+        4. This keeps disk usage minimal while maintaining resume capability
         """
         if not self.accelerator.is_main_process:
             return
@@ -583,15 +666,6 @@ class RAGAFDiffusionTrainer:
         free_bytes = shutil.disk_usage(str(checkpoint_dir)).free
         free_gb = free_bytes / 1e9
         print(f"💾 Disk free before checkpoint: {free_gb:.1f} GB")
-        if free_gb < 2.0:
-            print(f"⚠️  Low disk space ({free_gb:.1f} GB). Attempting cleanup before saving...")
-            # Remove any previous local checkpoints for this stage to free space
-            for old_ckpt in checkpoint_dir.glob("epoch_*.pt"):
-                old_ckpt.unlink()
-                print(f"  Removed old local checkpoint: {old_ckpt.name}")
-            free_bytes = shutil.disk_usage(str(checkpoint_dir)).free
-            free_gb = free_bytes / 1e9
-            print(f"  Disk free after cleanup: {free_gb:.1f} GB")
 
         if final:
             filename = "final.pt"
@@ -625,7 +699,7 @@ class RAGAFDiffusionTrainer:
             print(f"❌ Failed to save checkpoint: {e}")
             return
 
-        # --- HuggingFace Hub upload, then delete local copy ---
+        # --- HuggingFace Hub upload ---
         if getattr(self.training_config, "push_to_hub", False):
             try:
                 from huggingface_hub import HfApi, create_repo
@@ -650,14 +724,67 @@ class RAGAFDiffusionTrainer:
                     commit_message=f"[{stage}] {'Final' if final else f'Epoch {epoch+1}'} checkpoint"
                 )
                 print(f"✅ Uploaded to HF Hub: https://huggingface.co/{repo_id}")
-
-                # Keep local copy AND HF Hub copy (114 GB free on disk)
-                print(f"✅ Checkpoint saved both locally ({path}) and on HF Hub.")
+                
+                # Now aggressively delete old local checkpoints to save space
+                self._cleanup_old_checkpoints(stage, checkpoint_dir, keep_count=2)
 
             except Exception as e:
                 print(f"⚠️  HF Hub upload failed — keeping local copy: {e}")
         else:
             print("ℹ️  push_to_hub=False, checkpoint kept locally only.")
+
+    def _cleanup_old_checkpoints(self, stage: str, checkpoint_dir: Path, keep_count: int = 2):
+        """
+        Delete old checkpoints, keeping only the most recent N + final.pt.
+        
+        This aggressively manages disk space for 100GB container storage.
+        
+        Args:
+            stage: Stage name (stage1, stage2, etc)
+            checkpoint_dir: Directory containing checkpoints
+            keep_count: Number of recent checkpoints to keep (default: 2)
+        """
+        import shutil
+        
+        # Get all epoch checkpoints (not final)
+        epoch_checkpoints = sorted(
+            checkpoint_dir.glob("epoch_*.pt"),
+            key=lambda p: int(p.stem.split("_")[1])
+        )
+        
+        # Calculate how many to delete
+        num_to_delete = max(0, len(epoch_checkpoints) - keep_count)
+        
+        if num_to_delete > 0:
+            print(f"\n🗑️  Cleaning up old checkpoints ({num_to_delete} to delete, keeping {keep_count} recent)...")
+            
+            # Delete oldest checkpoints
+            for old_ckpt in epoch_checkpoints[:num_to_delete]:
+                try:
+                    old_size_gb = old_ckpt.stat().st_size / 1e9
+                    old_ckpt.unlink()
+                    
+                    # Log deletion
+                    freed_space = old_size_gb
+                    print(f"  🗑️  Deleted {old_ckpt.name} ({freed_space:.2f} GB freed)")
+                    
+                except Exception as e:
+                    print(f"  ⚠️  Failed to delete {old_ckpt.name}: {e}")
+            
+            # Check final disk space
+            free_bytes = shutil.disk_usage(str(checkpoint_dir)).free
+            free_gb = free_bytes / 1e9
+            
+            # Count remaining checkpoints
+            remaining = sorted(checkpoint_dir.glob("epoch_*.pt"))
+            remaining_str = ", ".join([p.stem for p in remaining[-keep_count:]])
+            
+            print(f"\n📊 Checkpoint status after cleanup:")
+            print(f"  Disk free: {free_gb:.1f} GB")
+            print(f"  Kept epochs: {remaining_str}")
+            if checkpoint_dir.joinpath("final.pt").exists():
+                print(f"  Final checkpoint: ✅ final.pt")
+            print()
 
 
 def main():

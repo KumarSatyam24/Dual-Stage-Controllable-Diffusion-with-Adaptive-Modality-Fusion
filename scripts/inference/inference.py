@@ -25,12 +25,17 @@ from torchvision.utils import save_image
 from diffusers import AutoencoderKL
 from transformers import CLIPTextModel, CLIPTokenizer
 
-from configs.config import ModelConfig, InferenceConfig
-from models.stage1_diffusion import Stage1SketchGuidedDiffusion, Stage1DiffusionPipeline
-from models.stage2_refinement import Stage2SemanticRefinement, Stage2RefinementPipeline
-from data.sketch_extraction import SketchExtractor
-from data.region_extraction import RegionExtractor
-from data.region_graph import RegionGraphBuilder
+# Add project root to path for imports
+PROJECT_ROOT = Path(__file__).parent.parent.parent
+import sys
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.configs.config import ModelConfig, InferenceConfig
+from src.models.stage1_diffusion import Stage1SketchGuidedDiffusion, Stage1DiffusionPipeline
+from src.models.stage2_refinement import Stage2SemanticRefinement, Stage2RefinementPipeline
+from src.data.sketch_extraction import SketchExtractor
+from src.data.region_extraction import RegionExtractor
+from src.data.region_graph import RegionGraphBuilder
 
 
 class RAGAFDiffusionInference:

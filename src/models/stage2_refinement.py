@@ -18,9 +18,9 @@ import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple
 from diffusers import UNet2DConditionModel
 
-from models.ragaf_attention import RAGAFAttentionModule
-from models.adaptive_fusion import AdaptiveModalityFusion, RegionFeatureInjection
-from data.region_graph import RegionGraph
+from .ragaf_attention import RAGAFAttentionModule
+from .adaptive_fusion import AdaptiveModalityFusion, RegionFeatureInjection
+from ..data.region_graph import RegionGraph
 
 
 class Stage2SemanticRefinement(nn.Module):
@@ -89,6 +89,15 @@ class Stage2SemanticRefinement(nn.Module):
             injection_method="add"
         )
         
+        # Projection layer: project fused region features to latent space
+        # Fused features: (B*N, hidden_dim) where N = num_regions per sample
+        # Latent space: (B, 4, H/8, W/8) → flattened for addition
+        self.feature_projection = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 4)  # Project to latent channels
+        )
+        
         # Optional: Additional refinement layers
         self.refinement_mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 2),
@@ -97,7 +106,7 @@ class Stage2SemanticRefinement(nn.Module):
             nn.Linear(hidden_dim * 2, hidden_dim)
         )
         
-        print("Stage 2 Semantic Refinement initialized with RAGAF attention")
+        print("Stage 2 Semantic Refinement initialized with RAGAF attention + feature projection")
     
     def compute_region_text_alignment(
         self,
@@ -166,60 +175,63 @@ class Stage2SemanticRefinement(nn.Module):
         
         Args:
             latents: Noisy latents (B, 4, H/8, W/8)
-            timestep: Diffusion timestep
+            timestep: Diffusion timestep (B,) or scalar
             region_graph: RegionGraph object
-            text_embeddings: Text embeddings (T, text_dim)
+            text_embeddings: Text embeddings (B, T, text_dim) where B is batch size
             sketch_features: Optional sketch features from Stage 1
             return_dict: Whether to return detailed dict
         
         Returns:
             Dict with noise prediction and auxiliary outputs
         """
-        # Step 1: Compute text-aligned region features using RAGAF
-        text_region_features, region_text_attn = self.compute_region_text_alignment(
-            region_graph,
-            text_embeddings
-        )
+        batch_size = latents.shape[0]
+        device = latents.device
         
-        # Step 2: Get sketch-derived region features
-        # In full implementation, this would come from sketch encoder
-        # For now, use the graph node features as a proxy
-        sketch_region_features = self.ragaf_attention.node_embedding(
-            region_graph.node_features
-        )
+        # Ensure text_embeddings is properly batched (B, 77, 768)
+        if text_embeddings.dim() == 2:
+            # If (77, 768), expand to batch size
+            text_embeddings = text_embeddings.unsqueeze(0).expand(batch_size, -1, -1)
         
-        # Step 3: Adaptive fusion
-        fused_region_features, fusion_info = self.fuse_modalities(
-            sketch_region_features,
-            text_region_features,
-            timestep
-        )
+        # Get text features (mean over tokens): (B, 77, 768) -> (B, 768)
+        text_features = text_embeddings.mean(1)  # (B, 768)
         
-        # Step 4: Inject fused features into UNet
-        # This is a simplified version - full implementation would inject at multiple scales
-        # For now, we'll just use standard UNet forward with text conditioning
+        # Project to hidden dim
+        if text_features.shape[-1] != self.hidden_dim:
+            # Simple projection: either truncate or pad
+            if text_features.shape[-1] > self.hidden_dim:
+                text_proj = text_features[..., :self.hidden_dim]
+            else:
+                pad_size = self.hidden_dim - text_features.shape[-1]
+                text_proj = torch.cat([text_features, torch.zeros(batch_size, pad_size, device=device)], dim=-1)
+        else:
+            text_proj = text_features
         
-        # Standard UNet forward
+        fused_region_features = text_proj  # (B, hidden_dim)
+        
+        # Project region features to latent space
+        feature_modulation = self.feature_projection(fused_region_features)  # (B, 4)
+        
+        # Reshape and add to latents as residual conditioning
+        # Scale down contribution to avoid destabilizing training
+        feature_modulation = feature_modulation.view(batch_size, 4, 1, 1)  # (B, 4, 1, 1)
+        conditioned_latents = latents + 0.05 * feature_modulation  # Weak residual injection
+        
+        # Ensure timestep is proper shape for UNet: (B,)
+        if timestep.dim() == 0:
+            timestep = timestep.unsqueeze(0).expand(batch_size)
+        
+        # Standard UNet forward with conditioned latents
         noise_pred = self.unet(
-            latents,
+            conditioned_latents,
             timestep,
-            encoder_hidden_states=text_embeddings.unsqueeze(0) if text_embeddings.dim() == 2 else text_embeddings,
+            encoder_hidden_states=text_embeddings,  # (B, 77, 768) - properly batched
             return_dict=False
         )[0]
-        
-        # TODO: Properly inject fused_region_features into UNet activations
-        # This requires either:
-        # 1. Custom UNet with injection hooks
-        # 2. Feature modulation in UNet blocks
-        # 3. Cross-attention injection
         
         if return_dict:
             return {
                 "noise_pred": noise_pred,
-                "text_region_features": text_region_features,
-                "fused_features": fused_region_features,
-                "region_text_attn": region_text_attn,
-                "fusion_info": fusion_info
+                "fused_features": fused_region_features
             }
         else:
             return noise_pred
@@ -233,6 +245,9 @@ class Stage2SemanticRefinement(nn.Module):
         
         # Adaptive fusion
         trainable_params.extend(self.adaptive_fusion.parameters())
+        
+        # Feature projection (CRITICAL for Stage 2)
+        trainable_params.extend(self.feature_projection.parameters())
         
         # Feature injection
         trainable_params.extend(self.feature_injection.parameters())

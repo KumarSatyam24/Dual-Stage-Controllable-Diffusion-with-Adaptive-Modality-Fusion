@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple
 import math
 
-from data.region_graph import RegionGraph
+from ..data.region_graph import RegionGraph
 
 
 class RegionGraphAttention(nn.Module):
@@ -116,10 +116,15 @@ class RegionGraphAttention(nn.Module):
         
         attn_scores = (Q_tgt * K_src).sum(dim=-1) / self.scale  # (E, heads)
         
-        # Add edge weights if available
-        if edge_weights is not None:
-            edge_weights_proj = self.edge_proj(edge_weights.unsqueeze(-1))  # (E, heads)
-            attn_scores = attn_scores + edge_weights_proj
+        # Add edge weights if available and valid
+        if edge_weights is not None and edge_weights.numel() > 0:
+            # Ensure edge_weights is 1D
+            if edge_weights.dim() > 1:
+                edge_weights = edge_weights.view(-1)
+            # Check if shape matches
+            if edge_weights.shape[0] == src_nodes.shape[0]:
+                edge_weights_proj = self.edge_proj(edge_weights.unsqueeze(-1))  # (E, heads)
+                attn_scores = attn_scores + edge_weights_proj
         
         # Aggregate attention per target node using scatter softmax
         # For each target node, softmax over all incoming edges
@@ -377,13 +382,22 @@ class RAGAFAttentionModule(nn.Module):
         # Initial embedding
         node_features = self.node_embedding(region_graph.node_features)  # (N, hidden_dim)
         
+        # Ensure edge_weights is properly formatted if it exists
+        edge_weights = region_graph.edge_weights
+        if edge_weights is not None:
+            # Make sure it's on the same device as node_features
+            edge_weights = edge_weights.to(node_features.device)
+            # Ensure it's 1D
+            if edge_weights.dim() > 1:
+                edge_weights = edge_weights.view(-1)
+        
         # Apply graph attention layers
         for graph_layer, norm in zip(self.graph_layers, self.graph_norms):
             # Graph attention with residual
             graph_output = graph_layer(
                 node_features,
                 region_graph.edge_index,
-                region_graph.edge_weights
+                edge_weights
             )
             node_features = norm(node_features + graph_output)
         

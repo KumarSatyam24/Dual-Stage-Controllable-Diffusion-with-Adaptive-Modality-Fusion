@@ -26,9 +26,9 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 from pycocotools.coco import COCO
 
-from data.sketch_extraction import SketchExtractor
-from data.region_extraction import RegionExtractor
-from data.region_graph import RegionGraphBuilder, RegionGraph
+from ..data.sketch_extraction import SketchExtractor
+from ..data.region_extraction import RegionExtractor
+from ..data.region_graph import RegionGraphBuilder, RegionGraph
 
 
 class COCODataset(Dataset):
@@ -112,6 +112,7 @@ class COCODataset(Dataset):
         )
         self.graph_builder = graph_builder or RegionGraphBuilder(
             graph_type="hybrid",
+            feature_type="spatial",  # Use only spatial features (6 dims)
             image_size=(image_size, image_size)
         )
         
