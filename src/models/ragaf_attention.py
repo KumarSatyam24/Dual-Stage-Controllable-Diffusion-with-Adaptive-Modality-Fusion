@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple
 import math
 
-from ..data.region_graph import RegionGraph
+from src.data.region_graph import RegionGraph
 
 
 class RegionGraphAttention(nn.Module):
@@ -422,7 +422,7 @@ if __name__ == "__main__":
     print("=" * 60)
     
     # Create dummy region graph
-    from data.region_graph import RegionGraph
+    from src.data.region_graph import RegionGraph
     
     num_nodes = 10
     node_features = torch.randn(num_nodes, 6)  # Spatial features

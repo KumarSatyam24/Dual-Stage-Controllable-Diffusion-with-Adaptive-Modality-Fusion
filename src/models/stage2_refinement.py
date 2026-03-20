@@ -18,9 +18,9 @@ import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple
 from diffusers import UNet2DConditionModel
 
-from .ragaf_attention import RAGAFAttentionModule
-from .adaptive_fusion import AdaptiveModalityFusion, RegionFeatureInjection
-from ..data.region_graph import RegionGraph
+from src.models.ragaf_attention import RAGAFAttentionModule
+from src.models.adaptive_fusion import AdaptiveModalityFusion, RegionFeatureInjection
+from src.data.region_graph import RegionGraph
 
 
 class Stage2SemanticRefinement(nn.Module):

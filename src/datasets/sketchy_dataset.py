@@ -31,9 +31,9 @@ import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
 
-from ..data.sketch_extraction import SketchExtractor
-from ..data.region_extraction import RegionExtractor
-from ..data.region_graph import RegionGraphBuilder, RegionGraph
+from src.data.sketch_extraction import SketchExtractor
+from src.data.region_extraction import RegionExtractor
+from src.data.region_graph import RegionGraphBuilder, RegionGraph
 
 
 class SketchyDataset(Dataset):

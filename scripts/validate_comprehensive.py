@@ -116,16 +116,10 @@ class ComprehensiveValidator:
             ).to(self.device)
             unet.eval()
             
-            # Deferred import to avoid relative import issues
-            import importlib.util
-            spec = importlib.util.spec_from_file_location(
-                "stage2_refinement",
-                project_root / "src" / "models" / "stage2_refinement.py"
-            )
-            stage2_module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(stage2_module)
+            # Import Stage 2 model directly
+            from models.stage2_refinement import Stage2SemanticRefinement
             
-            self.model = stage2_module.Stage2SemanticRefinement(
+            self.model = Stage2SemanticRefinement(
                 unet=unet,
                 node_feature_dim=6,
                 text_dim=768,
@@ -138,15 +132,9 @@ class ComprehensiveValidator:
             print("   ✅ Stage 2 model loaded")
         else:
             # Load Stage 1
-            import importlib.util
-            spec = importlib.util.spec_from_file_location(
-                "stage1_diffusion",
-                project_root / "src" / "models" / "stage1_diffusion.py"
-            )
-            stage1_module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(stage1_module)
+            from models.stage1_diffusion import Stage1SketchGuidedDiffusion
             
-            self.model = stage1_module.Stage1SketchGuidedDiffusion(
+            self.model = Stage1SketchGuidedDiffusion(
                 pretrained_model_name=model_name,
                 sketch_encoder_channels=[320, 640, 1280, 1280],
                 freeze_base_unet=False,
@@ -170,16 +158,10 @@ class ComprehensiveValidator:
         """Load validation dataset."""
         print("📁 Loading validation dataset...")
         
-        # Deferred import
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "sketchy_dataset",
-            project_root / "src" / "datasets" / "sketchy_dataset.py"
-        )
-        dataset_module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(dataset_module)
+        # Load dataset
+        from datasets.sketchy_dataset import SketchyDataset
         
-        self.val_dataset = dataset_module.SketchyDataset(
+        self.val_dataset = SketchyDataset(
             root_dir="/workspace/sketchy",
             split='test',
             image_size=256,
@@ -189,90 +171,129 @@ class ComprehensiveValidator:
         print(f"   Total validation samples: {len(self.val_dataset)}")
         print(f"   Will evaluate: {min(self.num_samples, len(self.val_dataset))} samples")
         print(f"   Coverage: {100 * min(self.num_samples, len(self.val_dataset)) / len(self.val_dataset):.2f}%\n")
-        print(f"   Coverage: {100 * min(self.num_samples, len(self.val_dataset)) / len(self.val_dataset):.2f}%\n")
         
     @torch.no_grad()
-    def validate(self):
-        """Run Stage 2 validation on samples."""
-        print("🚀 Starting Stage 2 validation...\n")
-        
+    def validate(self, save_examples=5):
+        print("🚀 Starting FULL diffusion validation...\n")
+
+        ssim_scores, psnr_scores, lpips_scores = [], [], []
         inference_times = []
+
         num_samples = min(self.num_samples, len(self.val_dataset))
-        
-        # Random sampling (reproducible)
         torch.manual_seed(42)
         indices = torch.randperm(len(self.val_dataset))[:num_samples]
-        
-        # Progress bar
+
+        output_dir = Path("validation_examples")
+        output_dir.mkdir(exist_ok=True)
+
         for idx_num, idx in enumerate(tqdm(indices, desc="Validating")):
             sample = self.val_dataset[idx]
+
+            sketch = sample['sketch'].unsqueeze(0).to(self.device)
+            photo = sample['photo'].unsqueeze(0).to(self.device)
             prompt = sample['text_prompt']
-            photo = sample['photo']
-            
+
             try:
                 start_time = time.time()
-                
-                # Encode image to latent
-                photo_tensor = photo.unsqueeze(0).to(self.device)
-                latents = self.vae.encode(photo_tensor).latent_dist.sample() * 0.18215
-                
-                # Encode text prompt
+
+                # ---- TEXT ENCODING ----
                 text_inputs = self.tokenizer(
                     [prompt],
                     padding="max_length",
                     max_length=77,
                     return_tensors="pt"
                 ).to(self.device)
+
                 text_embeddings = self.text_encoder(text_inputs.input_ids)[0]
-                
-                # Create noise and timestep
-                noise = torch.randn_like(latents)
-                timestep = torch.tensor([100], device=self.device)
-                
-                # Setup scheduler and add noise
-                self.noise_scheduler.set_timesteps(50)
-                noisy_latents = self.noise_scheduler.add_noise(latents, noise, timestep)
-                
-                # Get region graph from sample
-                region_graph = sample.get('region_graph', None)
-                
-                # Run Stage 2 model forward pass
-                output = self.model(
-                    noisy_latents,
-                    timestep,
-                    region_graph,
-                    text_embeddings,
-                    return_dict=True
-                )
-                
-                inference_time = time.time() - start_time
-                inference_times.append(inference_time)
-                
+
+                # ---- STAGE 1 GENERATION ----
+                latent = torch.randn(1, 4, 32, 32, device=self.device)
+                self.scheduler.set_timesteps(50)
+
+                # encode sketch (Stage 1)
+                if hasattr(self.model, "encode_sketch"):
+                    sketch_features = self.model.encode_sketch(sketch)
+                else:
+                    sketch_features = None
+
+                for t in self.scheduler.timesteps:
+                    t_tensor = torch.tensor([t], device=self.device)
+
+                    if self.stage == "Stage 1":
+                        noise_pred = self.model(latent, t_tensor, sketch_features, text_embeddings)
+
+                    else:
+                        # Stage 2: pass dummy region graph if missing
+                        region_graph = sample.get('region_graph', None)
+                        if region_graph is None:
+                            region_graph = None
+
+                        noise_pred = self.model(
+                            latent,
+                            t_tensor,
+                            region_graph,
+                            text_embeddings,
+                            return_dict=False
+                        )
+
+                    latent = self.scheduler.step(noise_pred, t, latent).prev_sample
+
+                # ---- DECODE ----
+                generated = self.vae.decode(latent / 0.18215).sample
+                generated = generated.clamp(-1, 1)
+
+                inference_times.append(time.time() - start_time)
+
+                # ---- METRICS ----
+                gen_np = self.tensor_to_numpy(generated)
+                gt_np = self.tensor_to_numpy(photo)
+
+                ssim_val = ssim(gen_np, gt_np, channel_axis=2)
+                psnr_val = psnr(gt_np, gen_np)
+
+                if self.lpips_model:
+                    lpips_val = self.lpips_model(
+                        generated, photo
+                    ).item()
+                else:
+                    lpips_val = 0.0
+
+                ssim_scores.append(ssim_val)
+                psnr_scores.append(psnr_val)
+                lpips_scores.append(lpips_val)
+
+                # ---- SAVE EXAMPLES ----
+                if idx_num < save_examples:
+                    self.save_example(
+                        sketch, gen_np, gt_np, prompt,
+                        idx_num, ssim_val, psnr_val, lpips_val,
+                        output_dir
+                    )
+
             except Exception as e:
-                print(f"\n⚠️  Error processing sample {idx}: {e}")
+                print(f"\n⚠️ Error on sample {idx}: {e}")
                 continue
-        
-        # Print results
+
+        # ---- FINAL RESULTS ----
         print("\n" + "="*60)
-        print("STAGE 2 VALIDATION RESULTS")
+        print("📊 FINAL VALIDATION RESULTS")
         print("="*60)
-        print(f"Epoch: {self.epoch}")
-        print(f"Samples Evaluated: {len(inference_times)}")
-        if inference_times:
-            avg_time = np.mean(inference_times)
-            std_time = np.std(inference_times)
-            print(f"Avg Inference Time: {avg_time:.4f}s per sample")
-            print(f"Throughput: {1/avg_time:.2f} samples/sec")
-            print(f"Std Dev: {std_time:.4f}s")
-        print("\n✅ Stage 2 model validation completed successfully!")
-        print("="*60 + "\n")
-        
+
+        print(f"Samples: {len(ssim_scores)}")
+
+        print(f"\nSSIM:  {np.mean(ssim_scores):.4f}")
+        print(f"PSNR:  {np.mean(psnr_scores):.2f} dB")
+        print(f"LPIPS: {np.mean(lpips_scores):.4f}")
+
+        print(f"\nAvg Time: {np.mean(inference_times):.4f}s")
+        print(f"Throughput: {1/np.mean(inference_times):.2f} samples/sec")
+
+        print("\n✅ Proper validation complete!\n")
+
         return {
-            "epoch": self.epoch,
-            "num_samples": len(inference_times),
-            "avg_inference_time": float(np.mean(inference_times)) if inference_times else 0,
-            "std_inference_time": float(np.std(inference_times)) if inference_times else 0,
-            "status": "success"
+            "ssim": float(np.mean(ssim_scores)),
+            "psnr": float(np.mean(psnr_scores)),
+            "lpips": float(np.mean(lpips_scores))
         }
     
     def save_example(self, sketch, generated, photo, prompt, idx, ssim_val, psnr_val, lpips_val, output_dir):
@@ -319,12 +340,12 @@ class ComprehensiveValidator:
                 text_embeddings = stage1.encode_text([prompt])
                 
                 latent = torch.randn(1, 4, 32, 32, device=self.device)
-                self.noise_scheduler.set_timesteps(50)
+                self.scheduler.set_timesteps(50)
                 
-                for t in self.noise_scheduler.timesteps:
+                for t in self.scheduler.timesteps:
                     timesteps = torch.tensor([t], device=self.device)
                     noise_pred = stage1(latent, timesteps, sketch_features, text_embeddings)
-                    latent = self.noise_scheduler.step(noise_pred, t, latent).prev_sample
+                    latent = self.scheduler.step(noise_pred, t, latent).prev_sample
                 
                 # Decode Stage 1 output
                 generated = self.vae.decode(latent / 0.18215).sample[0]
@@ -343,7 +364,7 @@ class ComprehensiveValidator:
                 # Add noise for refinement
                 noise = torch.randn_like(stage1_latent)
                 timesteps_refined = torch.randint(0, 1000, (1,), device=self.device)
-                noisy = self.noise_scheduler.add_noise(stage1_latent, noise, timesteps_refined)
+                noisy = self.scheduler.add_noise(stage1_latent, noise, timesteps_refined)
                 
                 # Stage 2 refinement forward pass
                 output = self.model(
@@ -363,12 +384,12 @@ class ComprehensiveValidator:
             text_embeddings = self.model.encode_text([prompt])
             
             latent = torch.randn(1, 4, 32, 32, device=self.device)
-            self.noise_scheduler.set_timesteps(50)
+            self.scheduler.set_timesteps(50)
             
-            for t in self.noise_scheduler.timesteps:
+            for t in self.scheduler.timesteps:
                 timesteps = torch.tensor([t], device=self.device)
                 noise_pred = self.model(latent, timesteps, sketch_features, text_embeddings)
-                latent = self.noise_scheduler.step(noise_pred, t, latent).prev_sample
+                latent = self.scheduler.step(noise_pred, t, latent).prev_sample
             
             generated = self.vae.decode(latent / 0.18215).sample[0]
         
@@ -391,6 +412,15 @@ class ComprehensiveValidator:
         
         # Sketch
         sketch_np = sketch[0].cpu().numpy()
+
+        # Fix shape
+        if sketch_np.shape[0] == 1:
+            sketch_np = sketch_np[0]  # (256,256)
+
+        # Normalize if needed
+        if sketch_np.max() <= 1:
+            sketch_np = (sketch_np * 255).astype(np.uint8)
+
         sketch_np = (sketch_np * 255).astype(np.uint8)
         axes[0].imshow(sketch_np, cmap='gray')
         axes[0].set_title('Input Sketch')
@@ -548,7 +578,7 @@ def main():
         device=args.device
     )
     
-    results = validator.validate(save_examples=5)
+    results = validator.validate()
 
 
 if __name__ == '__main__':
