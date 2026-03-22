@@ -40,6 +40,9 @@ class ModelConfig:
     use_lora: bool = True
     lora_rank: int = 4
     lora_alpha: int = 4
+    
+    # Refinement parameters
+    residual_alpha: float = 0.2  # Scaling factor for residual refinement (0.1 to 0.3)
 
 
 @dataclass
@@ -48,8 +51,8 @@ class DataConfig:
     
     # Datasets
     dataset_name: str = "sketchy"  # "sketchy", "coco", "both"
-    sketchy_root: str = "/workspace/sketchy"  # vast.ai - Google Drive sync destination
-    coco_root: str = "/workspace/coco"  # vast.ai container disk
+    sketchy_root: str = "./sketchy"  # Local path
+    coco_root: str = "./data/coco"  # Local path
     
     # Data processing
     image_size: int = 256  # Reduced from 512 → 4x faster, less VRAM, can upscale later
@@ -106,14 +109,27 @@ class TrainingConfig:
     
     # Checkpointing
     save_every_n_epochs: int = 2  # Save every 2 epochs → epoch_2, epoch_4, epoch_6, epoch_8, final
-    checkpoint_dir: str = "/root/checkpoints"  # 114 GB free on root filesystem
+    checkpoint_dir: str = "./checkpoints"  # Local checkpoint directory
     resume_from_checkpoint: Optional[str] = None
     resume_from_epoch: int = 0  # Set to N to resume training from epoch N
+    stage1_checkpoint: str = "./checkpoints/stage1_with_ssim/epoch_18.pt"
 
     # HuggingFace Hub auto-upload (never lose checkpoints again)
     push_to_hub: bool = True
     hub_repo_id: str = "DrRORAL/ragaf-diffusion-checkpoints"  # Will be created if not exists
     hub_token: Optional[str] = None  # Uses HF_TOKEN env var if None
+    
+    # Stage 2 refinement weights
+    lambda_identity: float = 0.5
+    lambda_lpips: float = 0.1
+    lambda_delta: float = 0.05  # Regularization on delta magnitude
+    
+    # Delta magnitude thresholds for adaptive control
+    delta_threshold_high: float = 0.5
+    delta_threshold_low: float = 0.01
+    
+    # Early stopping
+    early_stopping_patience: int = 5
     
     # Logging
     log_every_n_steps: int = 10
@@ -138,8 +154,8 @@ class InferenceConfig:
     """Inference configuration."""
     
     # Model checkpoint
-    stage1_checkpoint: str = "./checkpoints/stage1_final.pt"
-    stage2_checkpoint: str = "./checkpoints/stage2_final.pt"
+    stage1_checkpoint: str = "./checkpoints/stage1_with_ssim/epoch_18.pt"
+    stage2_checkpoint: str = "./checkpoints/stage2/final.pt"
     
     # Generation
     num_inference_steps: int = 50  # Stage 1

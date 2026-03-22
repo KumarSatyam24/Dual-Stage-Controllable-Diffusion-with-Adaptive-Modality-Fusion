@@ -6,9 +6,10 @@ Verify Stage 2 model can be loaded and initialized correctly.
 import sys
 import os
 
-# Add project to path
-sys.path.insert(0, '/root/Dual-Stage-Controllable-Diffusion-with-Adaptive-Modality-Fusion')
-os.chdir('/root/Dual-Stage-Controllable-Diffusion-with-Adaptive-Modality-Fusion')
+# Add project root to path
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, PROJECT_ROOT)
+os.chdir(PROJECT_ROOT)
 
 try:
     from src.models.stage2_refinement import Stage2SemanticRefinement

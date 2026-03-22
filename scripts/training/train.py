@@ -31,6 +31,12 @@ from accelerate import Accelerator
 from diffusers import AutoencoderKL, DDPMScheduler
 from diffusers.optimization import get_scheduler
 from transformers import CLIPTextModel, CLIPTokenizer
+import lpips
+from skimage.metrics import structural_similarity as ssim
+from skimage.metrics import peak_signal_noise_ratio as psnr
+import numpy as np
+from torchvision.utils import make_grid, save_image
+import json
 
 # Add project root to path for imports
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -102,6 +108,17 @@ class RAGAFDiffusionTrainer:
         # Initialize optimizers
         self.setup_optimizers()
         
+        # Initialize LPIPS for perceptual loss (Stage 2)
+        if self.training_config.train_stage in ["stage2", "both"]:
+            print("Initializing LPIPS perceptual loss...")
+            self.lpips_loss = lpips.LPIPS(net='alex').to(self.accelerator.device)
+            self.lpips_loss.requires_grad_(False)
+            
+            # Adaptive Refinement Control State
+            self.running_delta_mean = 0.0
+            self.delta_ema_momentum = 0.9
+            self.alpha_history = []
+        
         print(f"Trainer initialized on device: {self.accelerator.device}")
         print(f"Mixed precision: {training_config.mixed_precision}")
         print(f"Training stage: {training_config.train_stage}")
@@ -110,17 +127,34 @@ class RAGAFDiffusionTrainer:
         """Setup models for training."""
         print("Loading pretrained models...")
         
-        # Stage 1 model
-        if self.training_config.train_stage in ["stage1", "both"]:
-            self.stage1_model = Stage1SketchGuidedDiffusion(
-                pretrained_model_name=self.model_config.pretrained_model_name,
-                sketch_encoder_channels=self.model_config.sketch_encoder_channels,
-                freeze_base_unet=self.model_config.freeze_stage1_unet,
-                use_lora=self.model_config.use_lora,
-                lora_rank=self.model_config.lora_rank
-            )
-        else:
-            self.stage1_model = None
+        # Load Stage 1 model (always needed for Stage 2 conditioning)
+        self.stage1_model = Stage1SketchGuidedDiffusion(
+            pretrained_model_name=self.model_config.pretrained_model_name,
+            sketch_encoder_channels=self.model_config.sketch_encoder_channels,
+            freeze_base_unet=self.model_config.freeze_stage1_unet,
+            use_lora=self.model_config.use_lora,
+            lora_rank=self.model_config.lora_rank
+        )
+        
+        # Load Stage 1 weights if we are in Stage 2
+        if self.training_config.train_stage == "stage2":
+            # Check if checkpoint exists in config or environment
+            stage1_path = getattr(self.training_config, "stage1_checkpoint", None)
+            if not stage1_path:
+                # Try to find it in common locations
+                stage1_path = "./checkpoints/stage1_with_ssim/epoch_18.pt"
+            
+            if os.path.exists(stage1_path):
+                print(f"Loading Stage 1 weights from {stage1_path}")
+                ckpt = torch.load(stage1_path, map_location="cpu", weights_only=False)
+                self.stage1_model.load_state_dict(ckpt["model_state_dict"])
+            else:
+                print(f"WARNING: Stage 1 checkpoint not found at {stage1_path}. Stage 2 training might be suboptimal.")
+        
+        # Stage 1 model should be frozen during Stage 2 training
+        if self.training_config.train_stage == "stage2":
+            self.stage1_model.requires_grad_(False)
+            self.stage1_model.eval()
         
         # Stage 2 model
         if self.training_config.train_stage in ["stage2", "both"]:
@@ -139,10 +173,33 @@ class RAGAFDiffusionTrainer:
                 num_graph_layers=self.model_config.num_graph_layers,
                 num_attention_heads=self.model_config.num_attention_heads,
                 fusion_method=self.model_config.fusion_method,
-                use_region_adaptive_fusion=self.model_config.use_region_adaptive_fusion
+                use_region_adaptive_fusion=self.model_config.use_region_adaptive_fusion,
+                use_residual=True,
+                concatenate_stage1=True,
+                residual_alpha=getattr(self.model_config, "residual_alpha", 0.2)
             )
         else:
             self.stage2_model = None
+    
+    def compute_metrics(self, pred_images, gt_images):
+        """Compute SSIM and PSNR for a batch of images."""
+        pred_np = pred_images.detach().cpu().numpy().transpose(0, 2, 3, 1) # [B, H, W, 3]
+        gt_np = gt_images.detach().cpu().numpy().transpose(0, 2, 3, 1)
+        
+        # Scale from [-1, 1] to [0, 1]
+        pred_np = (pred_np + 1) / 2
+        gt_np = (gt_np + 1) / 2
+        
+        ssim_scores = []
+        psnr_scores = []
+        
+        for i in range(pred_np.shape[0]):
+            s = ssim(gt_np[i], pred_np[i], data_range=1.0, channel_axis=2)
+            p = psnr(gt_np[i], pred_np[i], data_range=1.0)
+            ssim_scores.append(s)
+            psnr_scores.append(p)
+            
+        return np.mean(ssim_scores), np.mean(psnr_scores)
         
         # Shared components
         self.vae = AutoencoderKL.from_pretrained(
@@ -346,77 +403,184 @@ class RAGAFDiffusionTrainer:
         
         return {"loss": loss}
     
+    def _generate_stage1_latents(self, sketch_features, text_embeddings, num_steps=5):
+        """Generate coarse latents from Stage 1 for Stage 2 conditioning."""
+        batch_size = text_embeddings.shape[0]
+        device = text_embeddings.device
+        
+        # Initialize with noise
+        latents = torch.randn(batch_size, 4, 32, 32, device=device) # Assuming 256x256 -> 32x32
+        
+        # Use a simple scheduler for few steps
+        from diffusers import DDIMScheduler
+        scheduler = DDIMScheduler.from_pretrained(
+            self.model_config.pretrained_model_name, subfolder="scheduler"
+        )
+        scheduler.set_timesteps(num_steps)
+        
+        for t in scheduler.timesteps:
+            # Scale model input
+            latent_model_input = scheduler.scale_model_input(latents, t)
+            
+            # Predict noise
+            noise_pred = self.stage1_model(
+                latent_model_input,
+                t.to(device),
+                sketch_features,
+                text_embeddings
+            )
+            
+            # Step scheduler
+            latents = scheduler.step(noise_pred, t, latents).prev_sample
+            
+        return latents
+
+    def compute_edge_similarity(self, img1, img2):
+        """Compute edge similarity using Sobel filters to assess structural preservation."""
+        # imgs are [B, 3, H, W] in [-1, 1]
+        def sobel_edges(x):
+            x = (x + 1) / 2 # [-1,1] -> [0,1]
+            # convert to grayscale
+            x = 0.2989 * x[:, 0:1, :, :] + 0.5870 * x[:, 1:2, :, :] + 0.1140 * x[:, 2:3, :, :]
+            
+            # kernels
+            kx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], device=x.device).view(1, 1, 3, 3).float()
+            ky = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], device=x.device).view(1, 1, 3, 3).float()
+            
+            gx = F.conv2d(x, kx, padding=1)
+            gy = F.conv2d(x, ky, padding=1)
+            mag = torch.sqrt(gx**2 + gy**2 + 1e-6)
+            return mag
+        
+        edges1 = sobel_edges(img1)
+        edges2 = sobel_edges(img2)
+        
+        # Pearson correlation or simple MSE between edge maps
+        similarity = F.cosine_similarity(edges1.flatten(1), edges2.flatten(1), dim=1).mean().item()
+        return similarity
+
     def train_stage2_step(self, batch: Dict, model=None) -> Dict:
         """
-        Single training step for Stage 2 - FAST BATCH VERSION.
-        Processes entire batch at once for maximum GPU utilization.
-        
-        Args:
-            batch: Batch of data
-            model: Model to use (if None, uses self.stage2_model)
-        
-        Returns:
-            Dict with loss and metrics
+        Refinement training step for Stage 2 with delta monitoring and adaptive control.
         """
-        # Use provided model or fall back to self.stage2_model
         stage2_model = model if model is not None else self.stage2_model
-        
         photos = batch["photo"].to(self.accelerator.device)
+        sketches = batch["sketch"].to(self.accelerator.device)
         text_prompts = batch["text_prompt"]
-        batch_size = photos.shape[0]
         
-        # Encode images to latents (fully batched)
+        # 1. Generate Stage-1 output (fully batched)
         with torch.no_grad():
-            latents = self.vae.encode(photos).latent_dist.sample()
-            latents = latents * 0.18215
+            sketch_features = self.stage1_model.encode_sketch(sketches)
+            text_embeddings = self.stage1_model.encode_text(text_prompts)
+            # Use 3 steps for speed during training
+            stage1_latents = self._generate_stage1_latents(sketch_features, text_embeddings, num_steps=3)
+            
+            # Encode Ground Truth to latents
+            gt_latents = self.vae.encode(photos).latent_dist.sample() * 0.18215
+
+        # 2. Sample reduced noise (t ~ Uniform(0, 200))
+        # Ensure T_MAX is 200 for refinement
+        T_MAX = 200
+        timesteps = torch.randint(0, T_MAX, (photos.shape[0],), device=photos.device)
         
-        # Sample noise and timesteps (fully batched)
-        noise = torch.randn_like(latents)
-        timesteps = torch.randint(
-            0, self.noise_scheduler.config.num_train_timesteps,
-            (latents.shape[0],),
-            device=latents.device
-        )
-        noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
+        # Add noise to GT latents
+        noise = torch.randn_like(gt_latents)
+        noisy_latents = self.noise_scheduler.add_noise(gt_latents, noise, timesteps)
         
-        # Encode text prompts (fully batched)
-        with torch.no_grad():
-            text_inputs = self.tokenizer(
-                text_prompts,
-                padding="max_length",
-                max_length=self.tokenizer.model_max_length,
-                truncation=True,
-                return_tensors="pt"
-            )
-            text_embeddings_batch = self.text_encoder(
-                text_inputs.input_ids.to(self.accelerator.device)
-            )[0]  # (B, 77, 768)
-        
-        # FAST BATCHED FORWARD PASS
-        # Use full batch text embeddings for proper batching
-        text_embeddings = text_embeddings_batch  # (B, 77, 768)
-        
-        # Get dummy region graph (use first sample)
+        # 3. Forward through Stage 2 with Stage-1 conditioning
+        # Get region graph (handle batch)
         region_graphs = batch["region_graph"]
+        # Use the first one for now or loop (Simplified for performance)
         region_graph = region_graphs[0] if isinstance(region_graphs, list) else region_graphs
         
-        # Move region graph to device
-        if hasattr(region_graph, 'node_features') and region_graph.node_features is not None:
-            region_graph.node_features = region_graph.node_features.to(self.accelerator.device)
-        
-        # Forward through Stage 2 with entire batch
-        output = stage2_model(
-            noisy_latents,  # (B, 4, H/8, W/8) - FULLY BATCHED
-            timesteps,      # (B,) - FULLY BATCHED
-            region_graph,   # Same region graph for all
-            text_embeddings,  # (B, 77, 768) - batched token embeddings
+        output_dict = stage2_model(
+            noisy_latents,
+            timesteps,
+            region_graph,
+            text_embeddings,
+            stage1_latents=stage1_latents,
             return_dict=True
         )
+        noise_pred = output_dict["noise_pred"]
         
-        noise_pred = output["noise_pred"]
-        loss = F.mse_loss(noise_pred, noise)
+        # 4. Losses and Delta Magnitude Monitoring (CRITICAL)
+        # Estimate x0 (denoised latents) for identity and perceptual loss
+        alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(photos.device)
+        alpha_t = alphas_cumprod[timesteps].view(-1, 1, 1, 1)
+        sigma_t = (1 - alpha_t).sqrt()
+        pred_x0_latents = (noisy_latents - sigma_t * noise_pred) / alpha_t.sqrt()
         
-        return {"loss": loss}
+        # Delta Magnitude Tracking
+        latent_delta = pred_x0_latents - stage1_latents
+        delta_mean = torch.mean(torch.abs(latent_delta)).item()
+        delta_std = torch.std(latent_delta).item()
+
+        # A. Diffusion loss (MSE)
+        loss_diffusion = F.mse_loss(noise_pred, noise)
+        
+        # B. Identity Preservation Loss (L1)
+        # Encourage Stage-2 to stay close to Stage-1 structure
+        loss_identity = F.l1_loss(pred_x0_latents, stage1_latents)
+        
+        # C. Perceptual Loss (LPIPS) and L_delta
+        # Requires decoding to image space
+        with torch.set_grad_enabled(True):
+            # Decode predicted latents to images
+            pred_images = self.vae.decode(pred_x0_latents / 0.18215).sample
+            pred_images = torch.clamp(pred_images, -1, 1)
+            
+            # Compute LPIPS between pred and ground truth
+            loss_perceptual = self.lpips_loss(pred_images, photos).mean()
+            
+            # L_delta: Regularization on magnitude of change in image space
+            with torch.no_grad():
+                s1_images = self.vae.decode(stage1_latents / 0.18215).sample
+                s1_images = torch.clamp(s1_images, -1, 1)
+            
+            image_delta = pred_images - s1_images
+            loss_delta = torch.mean(torch.abs(image_delta))
+        
+        # Final combined loss
+        # Use configurable weights from training_config
+        lambda_id = getattr(self.training_config, "lambda_identity", 0.5)
+        lambda_lpips = getattr(self.training_config, "lambda_lpips", 0.1)
+        lambda_delta = getattr(self.training_config, "lambda_delta", 0.05)
+        
+        total_loss = (
+            loss_diffusion 
+            + lambda_id * loss_identity 
+            + lambda_lpips * loss_perceptual
+            + lambda_delta * loss_delta
+        )
+        
+        # Compute Stage-2 metrics
+        s2_ssim, s2_psnr = self.compute_metrics(pred_images, photos)
+        s1_ssim, s1_psnr = self.compute_metrics(s1_images, photos)
+        edge_sim = self.compute_edge_similarity(pred_images, s1_images)
+
+        return {
+            "loss": total_loss,
+            "loss_diffusion": loss_diffusion.detach(),
+            "loss_identity": loss_identity.detach(),
+            "loss_perceptual": loss_perceptual.detach(),
+            "loss_delta": loss_delta.detach(),
+            "metrics": {
+                "s2_ssim": s2_ssim,
+                "s2_psnr": s2_psnr,
+                "s1_ssim": s1_ssim,
+                "delta_ssim": s2_ssim - s1_ssim,
+                "edge_sim": edge_sim,
+                "delta_mean": delta_mean,
+                "delta_std": delta_std
+            },
+            # Return images for grid generation
+            "images": {
+                "sketch": sketches,
+                "s1": s1_images,
+                "s2": pred_images,
+                "gt": photos
+            }
+        }
     
     def validate_stage2(self, model, num_samples: int = 4) -> Dict[str, float]:
         """
@@ -550,6 +714,12 @@ class RAGAFDiffusionTrainer:
             if 'unet' in name or 'sketch_encoder' in name:
                 p.requires_grad = True
 
+        # Ensure auxiliary models are on the same device
+        if hasattr(self, 'stage1_model') and self.stage1_model is not None:
+            self.stage1_model.to(self.accelerator.device)
+        if hasattr(self, 'lpips_loss') and self.lpips_loss is not None:
+            self.lpips_loss.to(self.accelerator.device)
+
         model, optimizer, train_dataloader, lr_scheduler = self.accelerator.prepare(
             model, optimizer, self.train_dataloader, lr_scheduler
         )
@@ -559,7 +729,7 @@ class RAGAFDiffusionTrainer:
             resume_path = self._find_resume_checkpoint(stage, start_epoch)
             if resume_path:
                 print(f"▶️  Resuming from checkpoint: {resume_path}")
-                ckpt = torch.load(resume_path, map_location=self.accelerator.device)
+                ckpt = torch.load(resume_path, map_location=self.accelerator.device, weights_only=False)
                 unwrapped = self.accelerator.unwrap_model(model)
                 unwrapped.load_state_dict(ckpt["model_state_dict"])
                 print(f"✅ Loaded weights from epoch {ckpt['epoch']+1}")
@@ -567,10 +737,53 @@ class RAGAFDiffusionTrainer:
                 print(f"⚠️  No local checkpoint found for epoch {start_epoch}, starting fresh.")
 
         global_step = start_epoch * len(train_dataloader)
+        
+        # Best model tracking and early stopping
+        best_ssim = -1.0
+        patience_counter = 0
+        patience = getattr(self.training_config, "early_stopping_patience", 5)
+        
+        # Diagnostics history
+        comparison_history = []
+        
+        # Identity sanity check helper (Stage 2)
+        def run_identity_check(model):
+            model.eval()
+            with torch.no_grad():
+                # Get a single sample
+                batch = next(iter(self.train_dataloader))
+                photos = batch["photo"][:1].to(self.accelerator.device)
+                sketches = batch["sketch"][:1].to(self.accelerator.device)
+                text_prompts = batch["text_prompt"][:1]
+                
+                # Encode Stage 1
+                sketch_features = self.stage1_model.encode_sketch(sketches)
+                text_embeddings = self.stage1_model.encode_text(text_prompts)
+                stage1_latents = self._generate_stage1_latents(sketch_features, text_embeddings, num_steps=3)
+                
+                # Zero noise, t=0
+                dummy_t = torch.zeros(1, device=self.accelerator.device, dtype=torch.long)
+                
+                output = model(
+                    stage1_latents, # Use stage1 directly as noisy input
+                    dummy_t,
+                    batch["region_graph"][0],
+                    text_embeddings,
+                    stage1_latents=stage1_latents,
+                    return_dict=True
+                )
+                
+                # If identity is preserved, noise_pred (delta) should be small
+                delta = output["noise_pred"]
+                error = torch.mean(torch.abs(delta)).item()
+                return error
+            model.train()
 
         for epoch in range(start_epoch, num_epochs):
             model.train()
             epoch_loss = 0.0
+            epoch_ssim = []
+            epoch_delta_means = []
             
             progress_bar = tqdm(
                 enumerate(train_dataloader),
@@ -581,25 +794,18 @@ class RAGAFDiffusionTrainer:
             
             for step, batch in progress_bar:
                 with self.accelerator.accumulate(model):
-                    # Training step (pass the wrapped model)
+                    # Training step
                     outputs = train_step_fn(batch, model=model)
                     loss = outputs["loss"]
-                    
-                    # Debug logging
-                    if step == 0:
-                        print(f"\nDEBUG - First step:")
-                        print(f"  loss.requires_grad: {loss.requires_grad}")
-                        print(f"  loss.grad_fn: {loss.grad_fn}")
-                        print(f"  model.training: {model.training}")
                     
                     # Backward
                     self.accelerator.backward(loss)
                     
-                    # Gradient clipping
+                    # Gradient clipping (Value: 1.0)
                     if self.accelerator.sync_gradients:
                         self.accelerator.clip_grad_norm_(
                             model.parameters(),
-                            self.training_config.max_grad_norm
+                            1.0
                         )
                     
                     # Optimizer step
@@ -607,34 +813,146 @@ class RAGAFDiffusionTrainer:
                     lr_scheduler.step()
                     optimizer.zero_grad()
                 
-                # Logging
+                # Metrics tracking
                 epoch_loss += loss.item()
+                if "metrics" in outputs:
+                    epoch_ssim.append(outputs["metrics"]["s2_ssim"])
+                    epoch_delta_means.append(outputs["metrics"]["delta_mean"])
+                
                 global_step += 1
                 
+                # Adaptive scaling automatic logic (Stage 2)
+                if stage == "stage2" and "metrics" in outputs and self.accelerator.is_main_process:
+                    d_mean = outputs["metrics"]["delta_mean"]
+                    
+                    # Update EMA
+                    if self.running_delta_mean == 0:
+                        self.running_delta_mean = d_mean
+                    else:
+                        self.running_delta_mean = (self.delta_ema_momentum * self.running_delta_mean) + (1 - self.delta_ema_momentum) * d_mean
+                    
+                    # Periodic adaptive update every 100 steps
+                    if global_step % 100 == 0:
+                        t_high = getattr(self.training_config, "delta_threshold_high", 0.5)
+                        t_low = getattr(self.training_config, "delta_threshold_low", 0.01)
+                        
+                        # Get unwrapped model to access residual_alpha
+                        unwrapped_model = self.accelerator.unwrap_model(model)
+                        old_alpha = unwrapped_model.residual_alpha
+                        
+                        if self.running_delta_mean > t_high:
+                            unwrapped_model.residual_alpha *= 0.9
+                            print(f"\n[Adaptive] EMA Delta ({self.running_delta_mean:.3f}) > High Threshold ({t_high}). Reducing residual_alpha: {old_alpha:.4f} -> {unwrapped_model.residual_alpha:.4f}")
+                        elif self.running_delta_mean < t_low:
+                            unwrapped_model.residual_alpha *= 1.1
+                            print(f"\n[Adaptive] EMA Delta ({self.running_delta_mean:.3f}) < Low Threshold ({t_low}). Increasing residual_alpha: {old_alpha:.4f} -> {unwrapped_model.residual_alpha:.4f}")
+                        
+                        # Clamp residual_alpha ∈ [0.05, 0.5]
+                        unwrapped_model.residual_alpha = max(0.05, min(0.5, unwrapped_model.residual_alpha))
+                
+                # Detailed Logging
                 if global_step % self.training_config.log_every_n_steps == 0:
                     avg_loss = epoch_loss / (step + 1)
                     lr = lr_scheduler.get_last_lr()[0]
                     
-                    progress_bar.set_postfix({
-                        "loss": f"{avg_loss:.4f}",
-                        "lr": f"{lr:.2e}"
-                    })
+                    logs = {
+                        f"{stage}/loss": avg_loss,
+                        f"{stage}/lr": lr,
+                    }
+                    if "metrics" in outputs:
+                        for k, v in outputs["metrics"].items():
+                            logs[f"{stage}/{k}"] = v
                     
                     if self.training_config.use_wandb and self.accelerator.is_main_process:
                         import wandb
-                        wandb.log({
-                            f"{stage}/loss": avg_loss,
-                            f"{stage}/lr": lr,
-                            f"{stage}/epoch": epoch,
-                            "global_step": global_step
-                        })
+                        wandb.log(logs)
+                    
+                    progress_bar.set_postfix({
+                        "loss": f"{avg_loss:.4f}",
+                        "s2_ssim": f"{np.mean(epoch_ssim) if epoch_ssim else 0:.3f}"
+                    })
+
+                # Visual Validation (every 500 steps)
+                if self.accelerator.is_main_process and global_step % 500 == 0 and "images" in outputs:
+                    self.save_visual_grid(outputs["images"], stage, global_step)
             
-            # Save checkpoint
+            # End of Epoch Evaluation and Diagnostics
+            avg_train_ssim = np.mean(epoch_ssim) if epoch_ssim else 0.0
+            
+            # Validation Step for Overfitting Detection
+            val_metrics = self.validate_stage2(model)
+            avg_val_ssim = val_metrics.get("val_ssim", 0.0)
+            
+            if self.accelerator.is_main_process:
+                print(f"\n[Epoch {epoch+1}] Train SSIM: {avg_train_ssim:.4f}, Val SSIM: {avg_val_ssim:.4f}")
+                
+                # Overfitting detection
+                if avg_train_ssim > avg_val_ssim + 0.1:
+                    print(f"🚨 [WARNING] Stage-2 Overfitting detected! (Train SSIM={avg_train_ssim:.3f}, Val SSIM={avg_val_ssim:.3f})")
+
+                # Identity Sanity Check (Stage 2)
+                id_err = 0.0
+                if stage == "stage2":
+                    id_err = run_identity_check(model)
+                    print(f"[Identity Check] Error: {id_err:.6f}")
+
+                # Save comparison log for this epoch
+                curr_alpha = getattr(self.accelerator.unwrap_model(model), "residual_alpha", 0.0)
+                self.alpha_history.append(curr_alpha)
+
+                epoch_log = {
+                    "epoch": epoch + 1,
+                    "ssim_train": avg_train_ssim,
+                    "ssim_val": avg_val_ssim,
+                    "delta_ssim": avg_train_ssim - (outputs["metrics"]["s1_ssim"] if "metrics" in outputs else 0),
+                    "identity_error": id_err,
+                    "delta_mean_avg": np.mean(epoch_delta_means) if epoch_delta_means else 0,
+                    "running_delta_mean_ema": self.running_delta_mean,
+                    "residual_alpha": curr_alpha
+                }
+                comparison_history.append(epoch_log)
+                
+                log_path = Path(self.training_config.checkpoint_dir) / stage / "comparison_logs.json"
+                with open(log_path, "w") as f:
+                    json.dump(comparison_history, f, indent=2)
+
+            # Save Best Model (based on Val SSIM if available, else Train)
+            eval_metric = avg_val_ssim if avg_val_ssim > 0 else avg_train_ssim
+            if eval_metric > best_ssim:
+                best_ssim = eval_metric
+                patience_counter = 0
+                print(f"🌟 New best evaluation score! Saving best_{stage}.pt")
+                self.save_checkpoint(stage, model, epoch, filename=f"best_{stage}.pt")
+            else:
+                patience_counter += 1
+                
+            # Early Stopping
+            if patience_counter >= patience:
+                print(f"🛑 Early stopping triggered after {patience} epochs without SSIM improvement.")
+                break
+
+            # Save periodic checkpoint
             if (epoch + 1) % self.training_config.save_every_n_epochs == 0:
                 self.save_checkpoint(stage, model, epoch)
         
         # Save final checkpoint
         self.save_checkpoint(stage, model, num_epochs, final=True)
+
+    def save_visual_grid(self, images_dict, stage, step):
+        """Save a grid of images for visual validation."""
+        # Convert grayscale sketch to 3-channel
+        sketches = images_dict["sketch"].repeat(1, 3, 1, 1) if images_dict["sketch"].shape[1] == 1 else images_dict["sketch"]
+        
+        # Rescale sketches to [-1, 1] for grid consistency if they are [0, 1]
+        if sketches.max() <= 1.0:
+            sketches = sketches * 2 - 1
+            
+        combined = torch.cat([sketches, images_dict["s1"], images_dict["s2"], images_dict["gt"]], dim=0)
+        grid = make_grid(combined, nrow=images_dict["gt"].shape[0], normalize=True, value_range=(-1, 1))
+        
+        out_dir = Path(self.training_config.checkpoint_dir) / "visuals" / stage
+        out_dir.mkdir(parents=True, exist_ok=True)
+        save_image(grid, out_dir / f"step_{step}.png")
     
     def _find_resume_checkpoint(self, stage: str, start_epoch: int) -> Optional[str]:
         """Find the best local checkpoint to resume from."""
@@ -646,15 +964,9 @@ class RAGAFDiffusionTrainer:
                 return str(path)
         return None
 
-    def save_checkpoint(self, stage: str, model, epoch: int, final: bool = False):
+    def save_checkpoint(self, stage: str, model, epoch: int, final: bool = False, filename: Optional[str] = None):
         """
         Save model checkpoint locally, upload to HuggingFace Hub, then aggressively cleanup old checkpoints.
-        
-        Strategy for 100GB container storage:
-        1. Save checkpoint locally
-        2. Upload to HuggingFace Hub
-        3. Delete older checkpoints (keep only 2 most recent + final)
-        4. This keeps disk usage minimal while maintaining resume capability
         """
         if not self.accelerator.is_main_process:
             return
@@ -663,11 +975,11 @@ class RAGAFDiffusionTrainer:
         import shutil
         checkpoint_dir = Path(self.training_config.checkpoint_dir) / stage
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        free_bytes = shutil.disk_usage(str(checkpoint_dir)).free
-        free_gb = free_bytes / 1e9
-        print(f"💾 Disk free before checkpoint: {free_gb:.1f} GB")
-
-        if final:
+        
+        if filename is not None:
+            # use provided filename
+            pass
+        elif final:
             filename = "final.pt"
         else:
             filename = f"epoch_{epoch+1}.pt"

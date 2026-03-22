@@ -1,3 +1,4 @@
+
 """
 Stage 2: Semantic Refinement with RAGAF Fusion
 
@@ -43,7 +44,10 @@ class Stage2SemanticRefinement(nn.Module):
         num_attention_heads: int = 8,
         fusion_method: str = "learned",
         use_region_adaptive_fusion: bool = True,
-        num_timesteps: int = 1000
+        num_timesteps: int = 1000,
+        use_residual: bool = True,
+        concatenate_stage1: bool = True,
+        residual_alpha: float = 0.2
     ):
         """
         Initialize Stage 2 model.
@@ -58,11 +62,21 @@ class Stage2SemanticRefinement(nn.Module):
             fusion_method: Method for adaptive fusion
             use_region_adaptive_fusion: Use region-specific fusion weights
             num_timesteps: Number of diffusion timesteps
+            use_residual: Whether to use residual learning
+            concatenate_stage1: Whether to concatenate Stage-1 latents to noisy input
+            residual_alpha: Scaling factor for residual refinement
         """
         super().__init__()
         
         self.unet = unet
         self.hidden_dim = hidden_dim
+        self.use_residual = use_residual
+        self.concatenate_stage1 = concatenate_stage1
+        self.residual_alpha = residual_alpha
+        
+        # Adjust UNet input channels if concatenating
+        if self.concatenate_stage1:
+            self._adjust_unet_input_channels()
         
         # RAGAF attention module
         self.ragaf_attention = RAGAFAttentionModule(
@@ -81,24 +95,21 @@ class Stage2SemanticRefinement(nn.Module):
             use_region_adaptive=use_region_adaptive_fusion
         )
         
-        # Feature injection module (to inject region features back into UNet)
-        # We'll inject at the bottleneck layer
+        # Feature injection module
         self.feature_injection = RegionFeatureInjection(
             region_feature_dim=hidden_dim,
-            spatial_feature_dim=1280,  # Typical UNet bottleneck dimension
+            spatial_feature_dim=1280,
             injection_method="add"
         )
         
-        # Projection layer: project fused region features to latent space
-        # Fused features: (B*N, hidden_dim) where N = num_regions per sample
-        # Latent space: (B, 4, H/8, W/8) → flattened for addition
+        # Projection layer
         self.feature_projection = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, 4)  # Project to latent channels
+            nn.Linear(hidden_dim, 4)
         )
         
-        # Optional: Additional refinement layers
+        # Refinement MLP
         self.refinement_mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 2),
             nn.SiLU(),
@@ -106,7 +117,25 @@ class Stage2SemanticRefinement(nn.Module):
             nn.Linear(hidden_dim * 2, hidden_dim)
         )
         
-        print("Stage 2 Semantic Refinement initialized with RAGAF attention + feature projection")
+        print(f"Stage 2 Semantic Refinement initialized. Residual: {use_residual}, Concat: {concatenate_stage1}")
+
+    def _adjust_unet_input_channels(self):
+        """Adjust UNet input channels to 8 for concatenation of Stage-1 latents."""
+        with torch.no_grad():
+            old_conv = self.unet.conv_in
+            new_conv = nn.Conv2d(
+                8,
+                old_conv.out_channels,
+                kernel_size=old_conv.kernel_size,
+                stride=old_conv.stride,
+                padding=old_conv.padding
+            )
+            new_conv.weight[:, :4, :, :] = old_conv.weight.clone()
+            new_conv.weight[:, 4:, :, :] = torch.zeros_like(old_conv.weight)
+            new_conv.bias = old_conv.bias
+            self.unet.conv_in = new_conv
+            if hasattr(self.unet, "config"):
+                self.unet.config.in_channels = 8
     
     def compute_region_text_alignment(
         self,
@@ -167,7 +196,7 @@ class Stage2SemanticRefinement(nn.Module):
         timestep: torch.Tensor,
         region_graph: RegionGraph,
         text_embeddings: torch.Tensor,
-        sketch_features: Optional[List[torch.Tensor]] = None,
+        stage1_latents: Optional[torch.Tensor] = None,
         return_dict: bool = False
     ) -> Dict:
         """
@@ -178,7 +207,7 @@ class Stage2SemanticRefinement(nn.Module):
             timestep: Diffusion timestep (B,) or scalar
             region_graph: RegionGraph object
             text_embeddings: Text embeddings (B, T, text_dim) where B is batch size
-            sketch_features: Optional sketch features from Stage 1
+            stage1_latents: Optional Stage-1 latents for conditioning (B, 4, H/8, W/8)
             return_dict: Whether to return detailed dict
         
         Returns:
@@ -187,54 +216,74 @@ class Stage2SemanticRefinement(nn.Module):
         batch_size = latents.shape[0]
         device = latents.device
         
+        # Strengthen conditioning on Stage-1
+        if self.concatenate_stage1:
+            if stage1_latents is None:
+                # Fallback to zeros (not ideal for training, but prevents crash)
+                stage1_latents = torch.zeros_like(latents)
+            unet_input = torch.cat([latents, stage1_latents], dim=1)  # (B, 8, H/8, W/8)
+        else:
+            unet_input = latents
+
         # Ensure text_embeddings is properly batched (B, 77, 768)
         if text_embeddings.dim() == 2:
-            # If (77, 768), expand to batch size
             text_embeddings = text_embeddings.unsqueeze(0).expand(batch_size, -1, -1)
         
-        # Get text features (mean over tokens): (B, 77, 768) -> (B, 768)
+        # Get text features (mean over tokens)
         text_features = text_embeddings.mean(1)  # (B, 768)
         
-        # Project to hidden dim
+        # Project to hidden dim if needed
         if text_features.shape[-1] != self.hidden_dim:
-            # Simple projection: either truncate or pad
-            if text_features.shape[-1] > self.hidden_dim:
-                text_proj = text_features[..., :self.hidden_dim]
-            else:
-                pad_size = self.hidden_dim - text_features.shape[-1]
-                text_proj = torch.cat([text_features, torch.zeros(batch_size, pad_size, device=device)], dim=-1)
+            if not hasattr(self, 'text_proj'):
+                self.text_proj = nn.Linear(text_features.shape[-1], self.hidden_dim).to(device)
+            fused_region_features = self.text_proj(text_features)
         else:
-            text_proj = text_features
+            fused_region_features = text_features
         
-        fused_region_features = text_proj  # (B, hidden_dim)
-        
-        # Project region features to latent space
+        # Project region features to latent space (Residual component)
         feature_modulation = self.feature_projection(fused_region_features)  # (B, 4)
-        
-        # Reshape and add to latents as residual conditioning
-        # Scale down contribution to avoid destabilizing training
-        feature_modulation = feature_modulation.view(batch_size, 4, 1, 1)  # (B, 4, 1, 1)
-        conditioned_latents = latents + 0.05 * feature_modulation  # Weak residual injection
+        feature_modulation = feature_modulation.view(batch_size, 4, 1, 1)
         
         # Ensure timestep is proper shape for UNet: (B,)
         if timestep.dim() == 0:
             timestep = timestep.unsqueeze(0).expand(batch_size)
         
-        # Standard UNet forward with conditioned latents
+        # Standard UNet forward with conditioned input
         noise_pred = self.unet(
-            conditioned_latents,
+            unet_input,
             timestep,
-            encoder_hidden_states=text_embeddings,  # (B, 77, 768) - properly batched
+            encoder_hidden_states=text_embeddings,
             return_dict=False
         )[0]
+        
+        # Apply residual scaling if requested: output = stage1 + alpha * delta
+        # Here we can interpret the noise_pred as the delta or add the feature modulation
+        if self.use_residual and stage1_latents is not None:
+            # We add the scaled feature modulation as a refinement to the noisy latents
+            # or we can treat the entire noise_pred as a delta.
+            # Scaling the contribution to stabilize training.
+            noise_pred = noise_pred + self.residual_alpha * feature_modulation
         
         if return_dict:
             return {
                 "noise_pred": noise_pred,
+                "feature_modulation": feature_modulation,
                 "fused_features": fused_region_features
             }
         else:
             return noise_pred
+
+    def predict_latent_delta(self, unet_input, timestep, text_embeddings):
+        """Explicitly predict the refinement delta for latent space."""
+        # This can be used if we want to bypass the standard diffusion noise pred
+        # and directly predict the latent refinement.
+        noise_pred = self.unet(
+            unet_input,
+            timestep,
+            encoder_hidden_states=text_embeddings,
+            return_dict=False
+        )[0]
+        return self.residual_alpha * noise_pred
     
     def get_trainable_parameters(self):
         """Get trainable parameters for optimization."""
