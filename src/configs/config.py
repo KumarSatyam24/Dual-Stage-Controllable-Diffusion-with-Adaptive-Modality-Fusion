@@ -64,8 +64,8 @@ class DataConfig:
     graph_type: str = "adjacency"  # Fastest graph type (was "hybrid")
     
     # Data loading
-    batch_size: int = 4  # Reduced to 2 to fit in 32GB VRAM (Stage 2 model is large)
-    num_workers: int = 0  # Disabled multiprocessing to avoid connection errors
+    batch_size: int = 1  # Mandatory for 4GB VRAM
+    num_workers: int = 2
     pin_memory: bool = True
     
     # Augmentation
@@ -98,10 +98,10 @@ class TrainingConfig:
     
     # Gradient
     max_grad_norm: float = 1.0
-    gradient_accumulation_steps: int = 3  # Accumulate 3 steps: effective batch_size = 2*3 = 6
+    gradient_accumulation_steps: int = 16  # Increased for 4GB VRAM (BS=1 * 16 = 16)
     
     # Mixed precision
-    mixed_precision: str = "no"  # Disable mixed precision for faster GPU utilization (use fp32)
+    mixed_precision: str = "fp16"  # REQUIRED for 4GB VRAM
     
     # Diffusion
     num_train_timesteps: int = 1000

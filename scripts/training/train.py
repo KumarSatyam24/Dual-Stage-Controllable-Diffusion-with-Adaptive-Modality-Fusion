@@ -155,6 +155,7 @@ class RAGAFDiffusionTrainer:
         if self.training_config.train_stage == "stage2":
             self.stage1_model.requires_grad_(False)
             self.stage1_model.eval()
+            self.stage1_model.to("cpu") # KEEP ON CPU UNTIL NEEDED (Dynamic Offloading)
         
         # Stage 2 model
         if self.training_config.train_stage in ["stage2", "both"]:
@@ -164,6 +165,18 @@ class RAGAFDiffusionTrainer:
                 self.model_config.pretrained_model_name,
                 subfolder="unet"
             )
+            
+            # --- Memory Optimization for 4GB VRAM ---
+            # 1. Gradient Checkpointing (Critical for 4GB)
+            unet.enable_gradient_checkpointing()
+            # 2. Memory Efficient Attention
+            try:
+                unet.set_use_memory_efficient_attention_xformers(True)
+                print("✅ xFormers attention enabled")
+            except Exception:
+                # Fallback to PyTorch's native SDPA if xFormers isn't installed
+                pass
+            # ----------------------------------------
             
             self.stage2_model = Stage2SemanticRefinement(
                 unet=unet,
@@ -461,20 +474,25 @@ class RAGAFDiffusionTrainer:
 
     def train_stage2_step(self, batch: Dict, model=None) -> Dict:
         """
-        Refinement training step for Stage 2 with delta monitoring and adaptive control.
+        Refined Stage 2 training with Sequential Model Offloading for 4GB VRAM.
         """
         stage2_model = model if model is not None else self.stage2_model
         photos = batch["photo"].to(self.accelerator.device)
         sketches = batch["sketch"].to(self.accelerator.device)
         text_prompts = batch["text_prompt"]
         
-        # 1. Generate Stage-1 output (fully batched)
+        # 1. Stage-1 Output (MOVE TO GPU, GENERATE, MOVE TO CPU)
         with torch.no_grad():
+            self.stage1_model.to(self.accelerator.device)
             sketch_features = self.stage1_model.encode_sketch(sketches)
             text_embeddings = self.stage1_model.encode_text(text_prompts)
             # Use 3 steps for speed during training
             stage1_latents = self._generate_stage1_latents(sketch_features, text_embeddings, num_steps=3)
             
+            # MOVE STAGE-1 BACK TO CPU TO FREE VRAM FOR STAGE-2 BACKWARD
+            self.stage1_model.to("cpu")
+            torch.cuda.empty_cache()
+
             # Encode Ground Truth to latents
             gt_latents = self.vae.encode(photos).latent_dist.sample() * 0.18215
 
