@@ -101,10 +101,13 @@ class RAGAFDiffusionTrainer:
         
         # Initialize models
         self.setup_models()
-        
+
+        # Initialize shared components (VAE, text encoder, scheduler)
+        self.setup_shared_components()
+
         # Initialize datasets
         self.setup_datasets()
-        
+
         # Initialize optimizers
         self.setup_optimizers()
         
@@ -194,26 +197,8 @@ class RAGAFDiffusionTrainer:
         else:
             self.stage2_model = None
     
-    def compute_metrics(self, pred_images, gt_images):
-        """Compute SSIM and PSNR for a batch of images."""
-        pred_np = pred_images.detach().cpu().numpy().transpose(0, 2, 3, 1) # [B, H, W, 3]
-        gt_np = gt_images.detach().cpu().numpy().transpose(0, 2, 3, 1)
-        
-        # Scale from [-1, 1] to [0, 1]
-        pred_np = (pred_np + 1) / 2
-        gt_np = (gt_np + 1) / 2
-        
-        ssim_scores = []
-        psnr_scores = []
-        
-        for i in range(pred_np.shape[0]):
-            s = ssim(gt_np[i], pred_np[i], data_range=1.0, channel_axis=2)
-            p = psnr(gt_np[i], pred_np[i], data_range=1.0)
-            ssim_scores.append(s)
-            psnr_scores.append(p)
-            
-        return np.mean(ssim_scores), np.mean(psnr_scores)
-        
+    def setup_shared_components(self):
+        """Setup shared components (VAE, text encoder, scheduler)."""
         # Shared components
         self.vae = AutoencoderKL.from_pretrained(
             self.model_config.pretrained_model_name,
@@ -221,26 +206,46 @@ class RAGAFDiffusionTrainer:
         )
         self.vae.requires_grad_(False)  # Freeze VAE
         self.vae.to(self.accelerator.device)  # Move to device
-        
+
         self.text_encoder = CLIPTextModel.from_pretrained(
             self.model_config.pretrained_model_name,
             subfolder="text_encoder"
         )
         self.text_encoder.requires_grad_(False)  # Freeze text encoder
         self.text_encoder.to(self.accelerator.device)  # Move to device
-        
+
         self.tokenizer = CLIPTokenizer.from_pretrained(
             self.model_config.pretrained_model_name,
             subfolder="tokenizer"
         )
-        
+
         # Noise scheduler
         self.noise_scheduler = DDPMScheduler.from_pretrained(
             self.model_config.pretrained_model_name,
             subfolder="scheduler"
         )
-        
-        print("Models loaded successfully")
+
+        print("Shared components loaded successfully")
+
+    def compute_metrics(self, pred_images, gt_images):
+        """Compute SSIM and PSNR for a batch of images."""
+        pred_np = pred_images.detach().cpu().numpy().transpose(0, 2, 3, 1) # [B, H, W, 3]
+        gt_np = gt_images.detach().cpu().numpy().transpose(0, 2, 3, 1)
+
+        # Scale from [-1, 1] to [0, 1]
+        pred_np = (pred_np + 1) / 2
+        gt_np = (gt_np + 1) / 2
+
+        ssim_scores = []
+        psnr_scores = []
+
+        for i in range(pred_np.shape[0]):
+            s = ssim(gt_np[i], pred_np[i], data_range=1.0, channel_axis=2)
+            p = psnr(gt_np[i], pred_np[i], data_range=1.0)
+            ssim_scores.append(s)
+            psnr_scores.append(p)
+
+        return np.mean(ssim_scores), np.mean(psnr_scores)
     
     def setup_datasets(self):
         """Setup datasets and dataloaders."""
@@ -481,16 +486,23 @@ class RAGAFDiffusionTrainer:
         sketches = batch["sketch"].to(self.accelerator.device)
         text_prompts = batch["text_prompt"]
         
-        # 1. Stage-1 Output (MOVE TO GPU, GENERATE, MOVE TO CPU)
+        # 1. Stage-1 Output (KEEP ON CPU TO SAVE VRAM)
         with torch.no_grad():
-            self.stage1_model.to(self.accelerator.device)
-            sketch_features = self.stage1_model.encode_sketch(sketches)
+            # Ensure stage1_model is entirely on CPU to avoid OOM on low VRAM GPUs
+            # Force move all submodules to CPU (some pretrained components may default to CUDA)
+            if next(self.stage1_model.parameters()).device.type != 'cpu':
+                self.stage1_model.to('cpu')
+
+            # Move inputs to CPU temporarily for stage1 inference
+            sketches_cpu = sketches.cpu()
+            sketch_features = self.stage1_model.encode_sketch(sketches_cpu)
             text_embeddings = self.stage1_model.encode_text(text_prompts)
             # Use 3 steps for speed during training
             stage1_latents = self._generate_stage1_latents(sketch_features, text_embeddings, num_steps=3)
-            
-            # MOVE STAGE-1 BACK TO CPU TO FREE VRAM FOR STAGE-2 BACKWARD
-            self.stage1_model.to("cpu")
+
+            # Move ALL stage1 outputs back to GPU for stage2
+            stage1_latents = stage1_latents.to(self.accelerator.device)
+            text_embeddings = text_embeddings.to(self.accelerator.device)
             torch.cuda.empty_cache()
 
             # Encode Ground Truth to latents

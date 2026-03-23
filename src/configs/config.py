@@ -52,7 +52,7 @@ class DataConfig:
     # Datasets
     dataset_name: str = "sketchy"  # "sketchy", "coco", "both"
     sketchy_root: str = "./sketchy"  # Local path
-    coco_root: str = "./data/coco"  # Local path
+    coco_root: str = "./coco"  # Local path
     
     # Data processing
     image_size: int = 256  # Reduced from 512 → 4x faster, less VRAM, can upscale later
