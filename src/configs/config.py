@@ -64,7 +64,7 @@ class DataConfig:
     graph_type: str = "adjacency"  # Fastest graph type (was "hybrid")
 
     # Data loading
-    batch_size: int = 8  # RTX 5090 32GB can handle larger batches
+    batch_size: int = 2  # Due to Stage1 + Stage2 + VAE + LPIPS, effective safe batch is small (2)
     num_workers: int = 8
     pin_memory: bool = True
 
@@ -86,7 +86,7 @@ class TrainingConfig:
     stage2_epochs: int = 10   # Increased from 2
     
     # Optimization
-    learning_rate: float = 1e-4
+    learning_rate: float = 2e-5
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     adam_epsilon: float = 1e-8
@@ -98,7 +98,7 @@ class TrainingConfig:
     
     # Gradient
     max_grad_norm: float = 1.0
-    gradient_accumulation_steps: int = 1  # RTX 5090 32GB: batch_size=16 fits without accumulation
+    gradient_accumulation_steps: int = 8  # RTX 5090 32GB: batch_size=16 fits without accumulation
 
     # Mixed precision
     mixed_precision: str = "bf16"  # RTX 5090 Blackwell natively supports bf16
@@ -108,7 +108,7 @@ class TrainingConfig:
     noise_scheduler: str = "ddpm"  # "ddpm", "ddim"
     
     # Checkpointing
-    save_every_n_epochs: int = 2  # Save every 2 epochs → epoch_2, epoch_4, epoch_6, epoch_8, final
+    save_every_n_epochs: int = 1  # Save every 2 epochs → epoch_2, epoch_4, epoch_6, epoch_8, final
     checkpoint_dir: str = "/workspace/checkpoints"
     resume_from_checkpoint: Optional[str] = None
     resume_from_epoch: int = 0  # Set to N to resume training from epoch N
