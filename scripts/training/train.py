@@ -533,7 +533,7 @@ class RAGAFDiffusionTrainer:
             sketch_features = self.stage1_model.encode_sketch(sketches)
             text_embeddings = self.stage1_model.encode_text(text_prompts)
             # Use 4 steps for faster Stage 1 conditioning during training (down from 10)
-            stage1_latents = self._generate_stage1_latents(sketch_features, text_embeddings, num_steps=4)
+            stage1_latents = self._generate_stage1_latents(sketch_features, text_embeddings, num_steps=8)
 
             # Encode Ground Truth to latents
             gt_latents = self.vae.encode(photos).latent_dist.sample() * 0.18215
@@ -543,9 +543,21 @@ class RAGAFDiffusionTrainer:
         timesteps = torch.randint(0, T_MAX, (photos.shape[0],), device=photos.device)
         
         # Add noise to GT latents
-        noise = torch.randn_like(gt_latents)
-        noisy_latents = self.noise_scheduler.add_noise(gt_latents, noise, timesteps)
-        
+        #noise = torch.randn_like(gt_latents)
+        #noisy_latents = self.noise_scheduler.add_noise(gt_latents, noise, timesteps)
+
+
+
+        #if torch.rand(1)<0.95:
+        #    base_latents = stage1_latents.detach()
+        #else:
+        #    base_latents = gt_latents
+            
+            
+        base_latents = stage1_latents.detach() #comment this if necessary
+        noise = torch.randn_like(base_latents)
+        noisy_latents = self.noise_scheduler.add_noise(base_latents, noise, timesteps)
+
         # 3. Forward through Stage 2 with Stage-1 conditioning
         # Get region graph (handle batch)
         region_graphs = batch["region_graph"]
@@ -584,7 +596,7 @@ class RAGAFDiffusionTrainer:
         with torch.set_grad_enabled(True):
             self._s2_step_count = getattr(self, "_s2_step_count", 0) + 1
             combined_latents = torch.cat([pred_x0_latents, stage1_latents], dim=0) / 0.18215
-            if self._s2_step_count % 100 == 0:
+            if self._s2_step_count % 50 == 0:
                 with torch.no_grad():
                     combined_images = self.vae.decode(combined_latents).sample
                 combined_images = torch.clamp(combined_images, -1, 1)
@@ -609,7 +621,7 @@ class RAGAFDiffusionTrainer:
         
         # Final combined loss
         # Use configurable weights from training_config
-        lambda_id = getattr(self.training_config, "lambda_identity", 0.5)
+        lambda_id = getattr(self.training_config, "lambda_identity", 0.2)
         lambda_lpips = getattr(self.training_config, "lambda_lpips", 0.1)
         lambda_delta = getattr(self.training_config, "lambda_delta", 0.05)
         
