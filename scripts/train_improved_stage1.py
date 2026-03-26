@@ -63,12 +63,12 @@ class ImprovedStage1Trainer:
         self,
         learning_rate: float = 1e-5,
         num_epochs: int = 20,
-        batch_size: int = 4,
+        batch_size: int = 16,
         use_perceptual_loss: bool = True,
         perceptual_weight: float = 0.1,
         freeze_unet: bool = False,
         lora_rank: int = 8,
-        checkpoint_dir: str = "/root/checkpoints/stage1_improved",
+        checkpoint_dir: str = "/workspace/checkpoints/stage1_improved",
         hf_repo: str = "DrRORAL/ragaf-diffusion-checkpoints",
         validate_every: int = 2,
         early_stopping_patience: int = 4,
@@ -252,7 +252,7 @@ class ImprovedStage1Trainer:
             self.train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
-            num_workers=4,
+            num_workers=8,
             pin_memory=True,
             collate_fn=collate_fn  # Use custom collate to handle RegionGraph
         )
@@ -653,11 +653,11 @@ def main():
     parser = argparse.ArgumentParser(description="Improved Stage-1 Training")
     parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate")
     parser.add_argument("--epochs", type=int, default=20, help="Number of epochs")
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
     parser.add_argument("--lora_rank", type=int, default=8, help="LoRA rank")
     parser.add_argument("--no_perceptual_loss", action="store_true", help="Disable perceptual loss")
     parser.add_argument("--freeze_unet", action="store_true", help="Freeze UNet")
-    parser.add_argument("--checkpoint_dir", type=str, default="/root/checkpoints/stage1_improved")
+    parser.add_argument("--checkpoint_dir", type=str, default="/workspace/checkpoints/stage1_improved")
     parser.add_argument("--hf_repo", type=str, default="DrRORAL/ragaf-diffusion-checkpoints")
     
     # WandB arguments

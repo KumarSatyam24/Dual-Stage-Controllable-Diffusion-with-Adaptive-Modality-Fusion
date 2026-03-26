@@ -10,7 +10,7 @@ Key improvements over previous version:
 5. ✅ Optimizes what we measure!
 
 Usage:
-    python train_stage1_with_ssim.py --resume_from /root/checkpoints/stage1_improved/epoch_12.pt
+    python train_stage1_with_ssim.py --resume_from /workspace/checkpoints/stage1_improved/epoch_12.pt
 
 Author: RAGAF-Diffusion Research Team  
 Date: March 9, 2026
@@ -57,13 +57,13 @@ class Stage1TrainerWithSSIM:
         self,
         learning_rate: float = 5e-6,  # Slightly higher than 4e-6 where it got stuck
         num_epochs: int = 25,  # Train to 25 instead of 20
-        batch_size: int = 8,  # Increased from 4 for better gradient estimates
+        batch_size: int = 16,  # RTX 5090 32GB
         use_perceptual_loss: bool = True,
         perceptual_weight: float = 0.1,
         ssim_weight: float = 0.3,  # NEW: SSIM loss weight
         freeze_unet: bool = False,
         lora_rank: int = 8,
-        checkpoint_dir: str = "/root/checkpoints/stage1_with_ssim",
+        checkpoint_dir: str = "/workspace/checkpoints/stage1_with_ssim",
         hf_repo: str = "DrRORAL/ragaf-diffusion-checkpoints",
         validate_every: int = 2,
         validation_samples: int = 100,  # NEW: 100 instead of 10
@@ -214,7 +214,7 @@ class Stage1TrainerWithSSIM:
             self.train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
-            num_workers=4,
+            num_workers=8,
             pin_memory=True,
             collate_fn=collate_fn
         )
@@ -641,8 +641,8 @@ def main():
                         help='Learning rate (default: 5e-6)')
     parser.add_argument('--epochs', type=int, default=25,
                         help='Number of epochs (default: 25)')
-    parser.add_argument('--batch_size', type=int, default=8,
-                        help='Batch size (default: 8, increased for better gradients)')
+    parser.add_argument('--batch_size', type=int, default=16,
+                        help='Batch size (default: 16, RTX 5090 32GB)')
     parser.add_argument('--ssim_weight', type=float, default=0.3,
                         help='SSIM loss weight (default: 0.3)')
     parser.add_argument('--validation_samples', type=int, default=100,

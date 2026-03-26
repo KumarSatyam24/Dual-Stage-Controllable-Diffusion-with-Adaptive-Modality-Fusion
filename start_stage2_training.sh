@@ -30,15 +30,15 @@ echo -e "${BLUE}╚════════════════════�
 # ============================================================================
 
 PROJECT_DIR=$(pwd)
-CHECKPOINT_DIR="${PROJECT_DIR}/checkpoints"
-STAGE1_CHECKPOINT="${CHECKPOINT_DIR}/stage1_with_ssim/epoch_18.pt"
-LOGS_DIR="${PROJECT_DIR}/logs"
+CHECKPOINT_DIR="/workspace/checkpoints"
+STAGE1_CHECKPOINT="/workspace/checkpoints/stage1/epoch_18.pt"
+LOGS_DIR="/workspace/logs"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 
 # Parse arguments
 STAGE="${1:-stage2}"              # Default: stage2
 EPOCHS="${2:-5}"                  # Default: 5 epochs (to match TrainingConfig)
-BATCH_SIZE="${3:-4}"              # Default: batch size 4
+BATCH_SIZE="${3:-16}"             # Default: batch size 16 (RTX 5090 32GB)
 LEARNING_RATE="${4:-1e-4}"        # Default: learning rate
 
 echo -e "${GREEN}Configuration:${NC}"
@@ -68,19 +68,19 @@ CKPT_SIZE=$(du -sh "${STAGE1_CHECKPOINT}" | cut -f1)
 echo -e "${GREEN}✅ Stage 1 checkpoint found (${CKPT_SIZE})${NC}"
 
 # Check Python
-if ! command -v python &> /dev/null; then
+if ! command -v .venv/bin/python &> /dev/null; then
     echo -e "${RED}❌ Python not found${NC}"
     exit 1
 fi
-PYTHON_VERSION=$(python --version 2>&1 | awk '{print $2}')
+PYTHON_VERSION=$(.venv/bin/python --version 2>&1 | awk '{print $2}')
 echo -e "${GREEN}✅ Python ${PYTHON_VERSION} available${NC}"
 
 # Check datasets
-if [ ! -d "${PROJECT_DIR}/sketchy" ]; then
-    echo -e "${RED}❌ Sketchy dataset not found at ${PROJECT_DIR}/sketchy${NC}"
+if [ ! -d "/workspace/sketchy" ]; then
+    echo -e "${RED}❌ Sketchy dataset not found at /workspace/sketchy${NC}"
     exit 1
 fi
-TRAIN_SAMPLES=$(find "${PROJECT_DIR}/sketchy" -name "*.jpg" 2>/dev/null | wc -l)
+TRAIN_SAMPLES=$(find "/workspace/sketchy" -name "*.jpg" 2>/dev/null | wc -l)
 echo -e "${GREEN}✅ Sketchy dataset found (~${TRAIN_SAMPLES} images)${NC}"
 
 # ============================================================================
@@ -103,7 +103,7 @@ echo -e "${GREEN}✅ Logs directory ready: ${LOGS_DIR}${NC}"
 
 echo -e "${YELLOW}[4/6] Verifying Stage 2 model...${NC}"
 
-python verify_stage2_model.py
+.venv/bin/python verify_stage2_model.py
 if [ $? -ne 0 ]; then
     exit 1
 fi
@@ -122,7 +122,7 @@ PID_FILE="${LOGS_DIR}/stage2_training_${TIMESTAMP}.pid"
 export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH}"
 
 # Build training command
-TRAIN_CMD="python -u scripts/training/train.py \
+TRAIN_CMD=".venv/bin/python -u scripts/training/train.py \
   --stage ${STAGE} \
   --batch_size ${BATCH_SIZE} \
   --learning_rate ${LEARNING_RATE} \

@@ -64,6 +64,9 @@ class ImprovedTrainingConfig(TrainingConfig):
     lr_warmup_steps: int = 1000  # Increased from 500
     lr_num_cycles: int = 3  # For cosine_with_restarts
     
+    # No gradient accumulation needed — batch_size=16 fits in 32GB VRAM directly
+    gradient_accumulation_steps: int = 1
+
     # Gradient clipping (prevent exploding gradients)
     max_grad_norm: float = 1.0
     
@@ -78,7 +81,7 @@ class ImprovedTrainingConfig(TrainingConfig):
     
     # Checkpointing - save every 2 epochs
     save_every_n_epochs: int = 2
-    checkpoint_dir: str = "/root/checkpoints"
+    checkpoint_dir: str = "/workspace/checkpoints"
     
     # HuggingFace Hub
     push_to_hub: bool = True
@@ -96,7 +99,7 @@ class ImprovedTrainingConfig(TrainingConfig):
     
     # Logging
     log_every_n_steps: int = 10
-    use_wandb: bool = False  # Can enable if needed
+    use_wandb: bool = True
     
     # Data augmentation during training
     use_advanced_augmentation: bool = True
@@ -111,12 +114,12 @@ class ImprovedDataConfig(DataConfig):
     dataset_name: str = "sketchy"
     sketchy_root: str = "/workspace/sketchy"
     
-    # Image size - keep at 256 for speed
-    image_size: int = 256
-    
-    # Batch size - can handle 4 on RTX 5090
-    batch_size: int = 4
-    num_workers: int = 4
+    # Image size - full 512 for RTX 5090 32GB
+    image_size: int = 512
+
+    # Batch size - RTX 5090 32GB can handle 16
+    batch_size: int = 16
+    num_workers: int = 8
     pin_memory: bool = True
     
     # Augmentation - enable for better generalization

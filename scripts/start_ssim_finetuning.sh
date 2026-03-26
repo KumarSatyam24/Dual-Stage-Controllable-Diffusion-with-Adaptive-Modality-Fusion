@@ -10,8 +10,8 @@ echo "========================="
 echo ""
 
 # Configuration
-CHECKPOINT_DIR="/root/checkpoints/stage1_with_ssim"
-FINETUNE_DIR="/root/checkpoints/ssim_finetuned"
+CHECKPOINT_DIR="/workspace/checkpoints/stage1_with_ssim"
+FINETUNE_DIR="/workspace/checkpoints/ssim_finetuned"
 LOG_FILE="train_ssim_finetune.log"
 
 # Parse arguments
@@ -38,8 +38,8 @@ echo ""
 mkdir -p "$FINETUNE_DIR"
 
 # Backup current best checkpoint
-BACKUP_PATH="/root/checkpoints/backups/before_ssim_finetune_$(date +%Y%m%d_%H%M%S).pt"
-mkdir -p /root/checkpoints/backups
+BACKUP_PATH="/workspace/checkpoints/backups/before_ssim_finetune_$(date +%Y%m%d_%H%M%S).pt"
+mkdir -p /workspace/checkpoints/backups
 echo "💾 Backing up checkpoint to: $BACKUP_PATH"
 cp "$BEST_CHECKPOINT" "$BACKUP_PATH"
 echo ""
@@ -118,7 +118,7 @@ cd ~/Dual-Stage-Controllable-Diffusion-with-Adaptive-Modality-Fusion
 echo "🚀 Starting SSIM fine-tuning..."
 nohup python train_stage1_with_ssim.py \
     --resume_from "$BEST_CHECKPOINT" \
-    --batch_size 4 \
+    --batch_size 16 \
     --ssim_weight "$SSIM_WEIGHT" \
     --perceptual_weight "$PERCEPTUAL_WEIGHT" \
     --mse_weight "$MSE_WEIGHT" \

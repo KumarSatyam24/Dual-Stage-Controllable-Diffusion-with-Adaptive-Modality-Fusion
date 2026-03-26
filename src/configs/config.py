@@ -51,29 +51,29 @@ class DataConfig:
     
     # Datasets
     dataset_name: str = "sketchy"  # "sketchy", "coco", "both"
-    sketchy_root: str = "./sketchy"  # Local path
-    coco_root: str = "./coco"  # Local path
+    sketchy_root: str = "/workspace/sketchy"
+    coco_root: str = "/workspace/coco"
     
     # Data processing
-    image_size: int = 256  # Reduced from 512 → 4x faster, less VRAM, can upscale later
+    image_size: int = 256  # half resolution for RTX 5090 32GB
     sketch_method: str = "canny"  # For COCO auto-sketch generation
-    
+
     # Region extraction
     min_region_area: int = 100
-    max_num_regions: int = 20  # Reduced from 50 → faster graph processing
+    max_num_regions: int = 50  # Full graph processing for RTX 5090 32GB
     graph_type: str = "adjacency"  # Fastest graph type (was "hybrid")
-    
+
     # Data loading
-    batch_size: int = 1  # Mandatory for 4GB VRAM
-    num_workers: int = 2
+    batch_size: int = 8  # RTX 5090 32GB can handle larger batches
+    num_workers: int = 8
     pin_memory: bool = True
-    
+
     # Augmentation
     use_augmentation: bool = True
-    
+
     # Cache
     cache_sketches: bool = True  # Cache auto-generated sketches (COCO only)
-    preload_graphs: bool = False  # Preload region graphs (memory intensive)
+    preload_graphs: bool = True  # Preload region graphs into memory (RTX 5090 32GB)
 
 
 @dataclass
@@ -83,7 +83,7 @@ class TrainingConfig:
     # Training stages
     train_stage: str = "stage2"  # "stage1", "stage2", "both" - Changed to stage2-only (Stage 1 already trained to epoch 18)
     stage1_epochs: int = 10  # Increased from 2 - more epochs = better quality
-    stage2_epochs: int = 5   # Increased from 2
+    stage2_epochs: int = 10   # Increased from 2
     
     # Optimization
     learning_rate: float = 1e-4
@@ -98,10 +98,10 @@ class TrainingConfig:
     
     # Gradient
     max_grad_norm: float = 1.0
-    gradient_accumulation_steps: int = 16  # Increased for 4GB VRAM (BS=1 * 16 = 16)
-    
+    gradient_accumulation_steps: int = 1  # RTX 5090 32GB: batch_size=16 fits without accumulation
+
     # Mixed precision
-    mixed_precision: str = "fp16"  # REQUIRED for 4GB VRAM
+    mixed_precision: str = "bf16"  # RTX 5090 Blackwell natively supports bf16
     
     # Diffusion
     num_train_timesteps: int = 1000
@@ -109,10 +109,10 @@ class TrainingConfig:
     
     # Checkpointing
     save_every_n_epochs: int = 2  # Save every 2 epochs → epoch_2, epoch_4, epoch_6, epoch_8, final
-    checkpoint_dir: str = "./checkpoints"  # Local checkpoint directory
+    checkpoint_dir: str = "/workspace/checkpoints"
     resume_from_checkpoint: Optional[str] = None
     resume_from_epoch: int = 0  # Set to N to resume training from epoch N
-    stage1_checkpoint: str = "./checkpoints/stage1_with_ssim/epoch_18.pt"
+    stage1_checkpoint: str = "/workspace/checkpoints/stage1/epoch_18.pt"
 
     # HuggingFace Hub auto-upload (never lose checkpoints again)
     push_to_hub: bool = True
@@ -125,8 +125,9 @@ class TrainingConfig:
     lambda_delta: float = 0.05  # Regularization on delta magnitude
     
     # Delta magnitude thresholds for adaptive control
-    delta_threshold_high: float = 0.5
-    delta_threshold_low: float = 0.01
+    # Calibrated to observed EMA delta range (~0.3–0.8); dead band = [0.35, 0.75]
+    delta_threshold_high: float = 0.75
+    delta_threshold_low: float = 0.35
     
     # Early stopping
     early_stopping_patience: int = 5
@@ -139,7 +140,7 @@ class TrainingConfig:
     
     # Validation
     validate_every_n_epochs: int = 2
-    num_validation_samples: int = 4
+    num_validation_samples: int = 16  # More validation samples with 32GB VRAM
     
     # Device
     device: str = "cuda"  # "cuda", "cpu"
@@ -154,8 +155,8 @@ class InferenceConfig:
     """Inference configuration."""
     
     # Model checkpoint
-    stage1_checkpoint: str = "./checkpoints/stage1_with_ssim/epoch_18.pt"
-    stage2_checkpoint: str = "./checkpoints/stage2/final.pt"
+    stage1_checkpoint: str = "/workspace/checkpoints/stage1/epoch_18.pt"
+    stage2_checkpoint: str = "/workspace/checkpoints/stage2/final.pt"
     
     # Generation
     num_inference_steps: int = 50  # Stage 1
@@ -164,7 +165,7 @@ class InferenceConfig:
     refinement_strength: float = 0.5
     
     # Output
-    output_dir: str = "./outputs"
+    output_dir: str = "/workspace/outputs"
     save_intermediates: bool = True  # Save Stage 1 output
     
     # Visualization

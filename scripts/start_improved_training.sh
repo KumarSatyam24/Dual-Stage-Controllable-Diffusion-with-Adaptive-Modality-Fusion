@@ -100,9 +100,9 @@ echo ""
 python3 train_improved_stage1.py \
     --learning_rate 1e-5 \
     --epochs 20 \
-    --batch_size 4 \
+    --batch_size 16 \
     --lora_rank 8 \
-    --checkpoint_dir /root/checkpoints/stage1_improved \
+    --checkpoint_dir /workspace/checkpoints/stage1_improved \
     --hf_repo DrRORAL/ragaf-diffusion-checkpoints \
     $NO_WANDB
 
@@ -112,9 +112,9 @@ echo "✅ TRAINING SCRIPT COMPLETED"
 echo "================================================================================"
 echo ""
 echo "Next steps:"
-echo "  1. Check checkpoints: ls /root/checkpoints/stage1_improved/"
-echo "  2. Review training log: cat /root/checkpoints/stage1_improved/training_log.json"
+echo "  1. Check checkpoints: ls /workspace/checkpoints/stage1_improved/"
+echo "  2. Review training log: cat /workspace/checkpoints/stage1_improved/training_log.json"
 echo "  3. View WandB dashboard: https://wandb.ai/your-username/ragaf-diffusion-stage1"
-echo "  4. Run validation: python validate_epochs.py --checkpoint_dir /root/checkpoints/stage1_improved"
+echo "  4. Run validation: python validate_epochs.py --checkpoint_dir /workspace/checkpoints/stage1_improved"
 echo ""
 echo "================================================================================"

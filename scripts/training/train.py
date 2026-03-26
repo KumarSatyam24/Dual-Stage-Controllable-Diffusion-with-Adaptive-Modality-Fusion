@@ -77,6 +77,11 @@ class RAGAFDiffusionTrainer:
         self.data_config = data_config
         self.training_config = training_config
         
+        # Force CUDA device before Accelerator init so it picks up the GPU
+        # (Accelerate may default to CPU when invoked via plain `python` without `accelerate launch`)
+        if torch.cuda.is_available():
+            torch.cuda.set_device(0)
+
         # Initialize accelerator for distributed training and mixed precision
         self.accelerator = Accelerator(
             mixed_precision=training_config.mixed_precision,
@@ -84,6 +89,11 @@ class RAGAFDiffusionTrainer:
             log_with="wandb" if training_config.use_wandb else None,
             project_dir=training_config.checkpoint_dir
         )
+
+        # Sanity-check device — if Accelerate still reports CPU despite CUDA being available, override
+        if str(self.accelerator.device) == "cpu" and torch.cuda.is_available():
+            print("WARNING: Accelerate reported CPU but CUDA is available. Forcing cuda:0.")
+            self.accelerator.state.device = torch.device("cuda", 0)
         
         # Setup logging
         if self.accelerator.is_main_process:
@@ -145,7 +155,7 @@ class RAGAFDiffusionTrainer:
             stage1_path = getattr(self.training_config, "stage1_checkpoint", None)
             if not stage1_path:
                 # Try to find it in common locations
-                stage1_path = "./checkpoints/stage1_with_ssim/epoch_18.pt"
+                stage1_path = "/workspace/checkpoints/stage1/epoch_18.pt"
             
             if os.path.exists(stage1_path):
                 print(f"Loading Stage 1 weights from {stage1_path}")
@@ -158,7 +168,7 @@ class RAGAFDiffusionTrainer:
         if self.training_config.train_stage == "stage2":
             self.stage1_model.requires_grad_(False)
             self.stage1_model.eval()
-            self.stage1_model.to("cpu") # KEEP ON CPU UNTIL NEEDED (Dynamic Offloading)
+            self.stage1_model.to(self.accelerator.device)  # Keep on GPU (RTX 5090 32GB)
         
         # Stage 2 model
         if self.training_config.train_stage in ["stage2", "both"]:
@@ -169,17 +179,15 @@ class RAGAFDiffusionTrainer:
                 subfolder="unet"
             )
             
-            # --- Memory Optimization for 4GB VRAM ---
-            # 1. Gradient Checkpointing (Critical for 4GB)
+            # Gradient checkpointing — needed for Stage 2 since Stage 1 also occupies GPU
             unet.enable_gradient_checkpointing()
-            # 2. Memory Efficient Attention
+            # Flash Attention via xFormers for throughput (optional speedup)
             try:
                 unet.set_use_memory_efficient_attention_xformers(True)
                 print("✅ xFormers attention enabled")
             except Exception:
-                # Fallback to PyTorch's native SDPA if xFormers isn't installed
+                # Fallback to PyTorch's native SDPA
                 pass
-            # ----------------------------------------
             
             self.stage2_model = Stage2SemanticRefinement(
                 unet=unet,
@@ -223,6 +231,12 @@ class RAGAFDiffusionTrainer:
         self.noise_scheduler = DDPMScheduler.from_pretrained(
             self.model_config.pretrained_model_name,
             subfolder="scheduler"
+        )
+
+        # DDIM scheduler for Stage 1 inference — created once and reused
+        from diffusers import DDIMScheduler
+        self.ddim_scheduler = DDIMScheduler.from_pretrained(
+            self.model_config.pretrained_model_name, subfolder="scheduler"
         )
 
         print("Shared components loaded successfully")
@@ -290,7 +304,7 @@ class RAGAFDiffusionTrainer:
         else:
             raise ValueError(f"Unknown dataset: {self.data_config.dataset_name}")
         
-        # Create dataloader
+        # Create train dataloader
         self.train_dataloader = DataLoader(
             train_dataset,
             batch_size=self.data_config.batch_size,
@@ -299,7 +313,43 @@ class RAGAFDiffusionTrainer:
             pin_memory=self.data_config.pin_memory,
             collate_fn=collate
         )
-        
+
+        # Create val dataloader (separate split to avoid train-set validation leakage)
+        try:
+            if self.data_config.dataset_name == "sketchy":
+                val_dataset = SketchyDataset(
+                    root_dir=self.data_config.sketchy_root,
+                    split="val",
+                    image_size=self.data_config.image_size,
+                    region_extractor=region_extractor,
+                    graph_builder=graph_builder,
+                    augment=False
+                )
+            else:
+                val_dataset = COCODataset(
+                    root_dir=self.data_config.coco_root,
+                    split="val",
+                    image_size=self.data_config.image_size,
+                    sketch_method=self.data_config.sketch_method,
+                    sketch_extractor=sketch_extractor,
+                    region_extractor=region_extractor,
+                    graph_builder=graph_builder,
+                    augment=False,
+                    cache_sketches=self.data_config.cache_sketches
+                )
+            self.val_dataloader = DataLoader(
+                val_dataset,
+                batch_size=self.data_config.batch_size,
+                shuffle=False,
+                num_workers=self.data_config.num_workers,
+                pin_memory=self.data_config.pin_memory,
+                collate_fn=collate
+            )
+            print(f"Val dataset loaded: {len(val_dataset)} samples")
+        except Exception as e:
+            print(f"Warning: Could not create val dataloader ({e}). Falling back to train set for validation.")
+            self.val_dataloader = self.train_dataloader
+
         print(f"Dataset loaded: {len(train_dataset)} samples")
     
     def setup_optimizers(self):
@@ -355,16 +405,7 @@ class RAGAFDiffusionTrainer:
         sketches = batch["sketch"].to(self.accelerator.device)
         photos = batch["photo"].to(self.accelerator.device)
         text_prompts = batch["text_prompt"]
-        
-        # Debug first batch
-        if not hasattr(self, '_debug_done'):
-            print(f"\nDEBUG batch shapes:")
-            print(f"  sketches: {sketches.shape}, dtype: {sketches.dtype}")
-            print(f"  photos: {photos.shape}, dtype: {photos.dtype}")
-            print(f"  Model type: {type(stage1_model)}")
-            print(f"  Model module type: {type(stage1_model.module) if hasattr(stage1_model, 'module') else 'no module attr'}")
-            self._debug_done = True
-        
+
         # Encode images to latents
         with torch.no_grad():
             latents = self.vae.encode(photos).latent_dist.sample()
@@ -388,17 +429,10 @@ class RAGAFDiffusionTrainer:
         
         # Encode sketch
         sketch_features = stage1_model.encode_sketch(sketches)
-        
+
         # Encode text
         text_embeddings = stage1_model.encode_text(text_prompts)
-        
-        # Check if we're in no_grad mode
-        if not hasattr(self, '_debug_done3'):
-            print(f"\nDEBUG grad mode:")
-            print(f"  torch.is_grad_enabled(): {torch.is_grad_enabled()}")
-            print(f"  Model training: {stage1_model.training}")
-            self._debug_done3 = True
-        
+
         # Predict noise
         noise_pred = stage1_model(
             noisy_latents,
@@ -406,15 +440,6 @@ class RAGAFDiffusionTrainer:
             sketch_features,
             text_embeddings
         )
-        
-        # Debug first batch
-        if not hasattr(self, '_debug_done2'):
-            print(f"\nDEBUG tensor info:")
-            print(f"  noisy_latents.requires_grad: {noisy_latents.requires_grad}")
-            print(f"  noise_pred.requires_grad: {noise_pred.requires_grad}")
-            print(f"  noise_pred.grad_fn: {noise_pred.grad_fn}")
-            print(f"  noise.requires_grad: {noise.requires_grad}")
-            self._debug_done2 = True
         
         # Compute loss
         loss = F.mse_loss(noise_pred, noise)
@@ -425,21 +450,17 @@ class RAGAFDiffusionTrainer:
         """Generate coarse latents from Stage 1 for Stage 2 conditioning."""
         batch_size = text_embeddings.shape[0]
         device = text_embeddings.device
-        
-        # Initialize with noise
-        latents = torch.randn(batch_size, 4, 32, 32, device=device) # Assuming 256x256 -> 32x32
-        
-        # Use a simple scheduler for few steps
-        from diffusers import DDIMScheduler
-        scheduler = DDIMScheduler.from_pretrained(
-            self.model_config.pretrained_model_name, subfolder="scheduler"
-        )
-        scheduler.set_timesteps(num_steps)
-        
-        for t in scheduler.timesteps:
+
+        # Initialize with noise — match stage1 training resolution (256x256 → 32x32 latents)
+        latents = torch.randn(batch_size, 4, 32, 32, device=device)
+
+        # Reuse shared DDIM scheduler — set_timesteps is cheap vs. from_pretrained
+        self.ddim_scheduler.set_timesteps(num_steps)
+
+        for t in self.ddim_scheduler.timesteps:
             # Scale model input
-            latent_model_input = scheduler.scale_model_input(latents, t)
-            
+            latent_model_input = self.ddim_scheduler.scale_model_input(latents, t)
+
             # Predict noise
             noise_pred = self.stage1_model(
                 latent_model_input,
@@ -447,9 +468,9 @@ class RAGAFDiffusionTrainer:
                 sketch_features,
                 text_embeddings
             )
-            
+
             # Step scheduler
-            latents = scheduler.step(noise_pred, t, latents).prev_sample
+            latents = self.ddim_scheduler.step(noise_pred, t, latents).prev_sample
             
         return latents
 
@@ -479,38 +500,25 @@ class RAGAFDiffusionTrainer:
 
     def train_stage2_step(self, batch: Dict, model=None) -> Dict:
         """
-        Refined Stage 2 training with Sequential Model Offloading for 4GB VRAM.
+        Refined Stage 2 training. RTX 5090 32GB: Stage 1 stays on GPU, no CPU offloading.
         """
         stage2_model = model if model is not None else self.stage2_model
         photos = batch["photo"].to(self.accelerator.device)
         sketches = batch["sketch"].to(self.accelerator.device)
         text_prompts = batch["text_prompt"]
-        
-        # 1. Stage-1 Output (KEEP ON CPU TO SAVE VRAM)
+
+        # 1. Stage-1 Output (on GPU — 32GB VRAM has headroom for both stages)
         with torch.no_grad():
-            # Ensure stage1_model is entirely on CPU to avoid OOM on low VRAM GPUs
-            # Force move all submodules to CPU (some pretrained components may default to CUDA)
-            if next(self.stage1_model.parameters()).device.type != 'cpu':
-                self.stage1_model.to('cpu')
-
-            # Move inputs to CPU temporarily for stage1 inference
-            sketches_cpu = sketches.cpu()
-            sketch_features = self.stage1_model.encode_sketch(sketches_cpu)
+            sketch_features = self.stage1_model.encode_sketch(sketches)
             text_embeddings = self.stage1_model.encode_text(text_prompts)
-            # Use 3 steps for speed during training
-            stage1_latents = self._generate_stage1_latents(sketch_features, text_embeddings, num_steps=3)
-
-            # Move ALL stage1 outputs back to GPU for stage2
-            stage1_latents = stage1_latents.to(self.accelerator.device)
-            text_embeddings = text_embeddings.to(self.accelerator.device)
-            torch.cuda.empty_cache()
+            # Use 10 steps for better quality stage1 conditioning during training
+            stage1_latents = self._generate_stage1_latents(sketch_features, text_embeddings, num_steps=10)
 
             # Encode Ground Truth to latents
             gt_latents = self.vae.encode(photos).latent_dist.sample() * 0.18215
 
-        # 2. Sample reduced noise (t ~ Uniform(0, 200))
-        # Ensure T_MAX is 200 for refinement
-        T_MAX = 200
+        # 2. Sample noise — full timestep range so Stage 2 learns all noise levels
+        T_MAX = self.noise_scheduler.config.num_train_timesteps  # 1000
         timesteps = torch.randint(0, T_MAX, (photos.shape[0],), device=photos.device)
         
         # Add noise to GT latents
@@ -553,20 +561,18 @@ class RAGAFDiffusionTrainer:
         loss_identity = F.l1_loss(pred_x0_latents, stage1_latents)
         
         # C. Perceptual Loss (LPIPS) and L_delta
-        # Requires decoding to image space
+        # Decode pred and stage1 latents in a single batched VAE call
         with torch.set_grad_enabled(True):
-            # Decode predicted latents to images
-            pred_images = self.vae.decode(pred_x0_latents / 0.18215).sample
-            pred_images = torch.clamp(pred_images, -1, 1)
-            
+            combined_latents = torch.cat([pred_x0_latents, stage1_latents], dim=0) / 0.18215
+            combined_images = self.vae.decode(combined_latents).sample
+            combined_images = torch.clamp(combined_images, -1, 1)
+            b = pred_x0_latents.shape[0]
+            pred_images = combined_images[:b]
+            s1_images = combined_images[b:].detach()
+
             # Compute LPIPS between pred and ground truth
             loss_perceptual = self.lpips_loss(pred_images, photos).mean()
-            
-            # L_delta: Regularization on magnitude of change in image space
-            with torch.no_grad():
-                s1_images = self.vae.decode(stage1_latents / 0.18215).sample
-                s1_images = torch.clamp(s1_images, -1, 1)
-            
+
             image_delta = pred_images - s1_images
             loss_delta = torch.mean(torch.abs(image_delta))
         
@@ -583,10 +589,14 @@ class RAGAFDiffusionTrainer:
             + lambda_delta * loss_delta
         )
         
-        # Compute Stage-2 metrics
-        s2_ssim, s2_psnr = self.compute_metrics(pred_images, photos)
-        s1_ssim, s1_psnr = self.compute_metrics(s1_images, photos)
-        edge_sim = self.compute_edge_similarity(pred_images, s1_images)
+        # Compute Stage-2 metrics — CPU-heavy, gated to every 10 steps
+        self._s2_step_count = getattr(self, '_s2_step_count', 0) + 1
+        if self._s2_step_count % 10 == 0:
+            s2_ssim, s2_psnr = self.compute_metrics(pred_images.detach(), photos)
+            s1_ssim, s1_psnr = self.compute_metrics(s1_images.detach(), photos)
+            edge_sim = self.compute_edge_similarity(pred_images.detach(), s1_images.detach())
+        else:
+            s2_ssim = s2_psnr = s1_ssim = s1_psnr = edge_sim = 0.0
 
         return {
             "loss": total_loss,
@@ -614,42 +624,45 @@ class RAGAFDiffusionTrainer:
     
     def validate_stage2(self, model, num_samples: int = 4) -> Dict[str, float]:
         """
-        Validate Stage 2 by checking that output differs from input.
-        
+        Validate Stage 2 on the held-out val set.
+
         Args:
             model: Stage 2 model
-            num_samples: Number of validation samples to process
-        
+            num_samples: Max samples to evaluate (uses first batch up to this limit)
+
         Returns:
             Dict with validation metrics
         """
         model.eval()
         device = self.accelerator.device
         val_loss = 0.0
-        num_processed = 0
-        
+
         with torch.no_grad():
-            for batch_idx, batch in enumerate(self.train_dataloader):
-                if batch_idx >= 1:  # Just process 1 batch for validation
+            for batch_idx, batch in enumerate(self.val_dataloader):
+                if batch_idx >= 1:  # 1 batch is enough for a quick val signal
                     break
-                
+
                 photos = batch["photo"].to(device)
                 text_prompts = batch["text_prompt"]
                 region_graphs = batch["region_graph"]
-                
+
+                # Trim to num_samples
+                bs = min(num_samples, photos.shape[0])
+                photos = photos[:bs]
+                text_prompts = text_prompts[:bs]
+                region_graphs = region_graphs[:bs] if isinstance(region_graphs, list) else region_graphs
+
                 # Encode images
-                latents = self.vae.encode(photos).latent_dist.sample()
-                latents = latents * 0.18215
-                
+                latents = self.vae.encode(photos).latent_dist.sample() * 0.18215
+
                 # Sample noise
                 noise = torch.randn_like(latents)
                 timesteps = torch.randint(
                     0, self.noise_scheduler.config.num_train_timesteps,
-                    (latents.shape[0],),
-                    device=device
+                    (bs,), device=device
                 )
                 noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
-                
+
                 # Encode text
                 text_inputs = self.tokenizer(
                     text_prompts,
@@ -658,27 +671,21 @@ class RAGAFDiffusionTrainer:
                     truncation=True,
                     return_tensors="pt"
                 )
-                text_embeddings_list = self.text_encoder(
-                    text_inputs.input_ids.to(device)
-                )[0]
-                
-                # Validate on first sample
-                batch_size = min(num_samples, photos.shape[0])
-                for i in range(batch_size):
-                    output = model(
-                        noisy_latents[i:i+1],
-                        timesteps[i:i+1],
-                        region_graphs[i],
-                        text_embeddings_list[i],
-                        return_dict=True
-                    )
-                    noise_pred = output["noise_pred"]
-                    loss = F.mse_loss(noise_pred, noise[i:i+1])
-                    val_loss += loss.item()
-                    num_processed += 1
-        
+                text_embeddings = self.text_encoder(text_inputs.input_ids.to(device))[0]
+
+                # Single batched forward pass (no per-sample loop)
+                output = model(
+                    noisy_latents,
+                    timesteps,
+                    region_graphs[0] if isinstance(region_graphs, list) else region_graphs,
+                    text_embeddings,
+                    return_dict=True
+                )
+                noise_pred = output["noise_pred"]
+                val_loss = F.mse_loss(noise_pred, noise).item()
+
         model.train()
-        return {"val_loss": val_loss / max(num_processed, 1)}
+        return {"val_loss": val_loss}
 
     
     def train(self):
@@ -744,9 +751,7 @@ class RAGAFDiffusionTrainer:
             if 'unet' in name or 'sketch_encoder' in name:
                 p.requires_grad = True
 
-        # Ensure auxiliary models are on the same device
-        if hasattr(self, 'stage1_model') and self.stage1_model is not None:
-            self.stage1_model.to(self.accelerator.device)
+        # Ensure auxiliary models are on the correct device
         if hasattr(self, 'lpips_loss') and self.lpips_loss is not None:
             self.lpips_loss.to(self.accelerator.device)
 
@@ -806,8 +811,8 @@ class RAGAFDiffusionTrainer:
                 # If identity is preserved, noise_pred (delta) should be small
                 delta = output["noise_pred"]
                 error = torch.mean(torch.abs(delta)).item()
-                return error
             model.train()
+            return error
 
         for epoch in range(start_epoch, num_epochs):
             model.train()
@@ -861,22 +866,32 @@ class RAGAFDiffusionTrainer:
                     else:
                         self.running_delta_mean = (self.delta_ema_momentum * self.running_delta_mean) + (1 - self.delta_ema_momentum) * d_mean
                     
-                    # Periodic adaptive update every 100 steps
-                    if global_step % 100 == 0:
-                        t_high = getattr(self.training_config, "delta_threshold_high", 0.5)
-                        t_low = getattr(self.training_config, "delta_threshold_low", 0.01)
-                        
-                        # Get unwrapped model to access residual_alpha
+                    # Adaptive update with hysteresis and cooldown (every 200 steps)
+                    # Thresholds calibrated to observed EMA delta range (~0.3–0.8)
+                    # Cooldown prevents continuous decay when delta is stuck above threshold
+                    if global_step % 200 == 0:
+                        t_high = getattr(self.training_config, "delta_threshold_high", 0.75)
+                        t_low = getattr(self.training_config, "delta_threshold_low", 0.35)
+                        cooldown = getattr(self, "_alpha_cooldown_steps", 0)
+
                         unwrapped_model = self.accelerator.unwrap_model(model)
                         old_alpha = unwrapped_model.residual_alpha
-                        
-                        if self.running_delta_mean > t_high:
-                            unwrapped_model.residual_alpha *= 0.9
-                            print(f"\n[Adaptive] EMA Delta ({self.running_delta_mean:.3f}) > High Threshold ({t_high}). Reducing residual_alpha: {old_alpha:.4f} -> {unwrapped_model.residual_alpha:.4f}")
-                        elif self.running_delta_mean < t_low:
-                            unwrapped_model.residual_alpha *= 1.1
-                            print(f"\n[Adaptive] EMA Delta ({self.running_delta_mean:.3f}) < Low Threshold ({t_low}). Increasing residual_alpha: {old_alpha:.4f} -> {unwrapped_model.residual_alpha:.4f}")
-                        
+
+                        if self.running_delta_mean > t_high and cooldown == 0:
+                            # Delta too large — reduce alpha slightly, then enforce cooldown
+                            unwrapped_model.residual_alpha *= 0.95
+                            self._alpha_cooldown_steps = 600  # ~3 update intervals
+                            print(f"\n[Adaptive] EMA Delta ({self.running_delta_mean:.3f}) > {t_high}. Reducing residual_alpha: {old_alpha:.4f} -> {unwrapped_model.residual_alpha:.4f}")
+                        elif self.running_delta_mean < t_low and cooldown == 0:
+                            # Delta too small — refinement is being suppressed, increase alpha
+                            unwrapped_model.residual_alpha *= 1.05
+                            self._alpha_cooldown_steps = 600
+                            print(f"\n[Adaptive] EMA Delta ({self.running_delta_mean:.3f}) < {t_low}. Increasing residual_alpha: {old_alpha:.4f} -> {unwrapped_model.residual_alpha:.4f}")
+                        else:
+                            # Inside dead band or in cooldown — leave alpha alone
+                            if cooldown > 0:
+                                self._alpha_cooldown_steps = max(0, cooldown - 200)
+
                         # Clamp residual_alpha ∈ [0.05, 0.5]
                         unwrapped_model.residual_alpha = max(0.05, min(0.5, unwrapped_model.residual_alpha))
                 
@@ -1041,37 +1056,35 @@ class RAGAFDiffusionTrainer:
             print(f"❌ Failed to save checkpoint: {e}")
             return
 
-        # --- HuggingFace Hub upload ---
+        # --- HuggingFace Hub upload (background thread — does not block training) ---
         if getattr(self.training_config, "push_to_hub", False):
-            try:
-                from huggingface_hub import HfApi, create_repo
-                token = getattr(self.training_config, "hub_token", None) or os.getenv("HF_TOKEN")
-                repo_id = self.training_config.hub_repo_id
-                api = HfApi(token=token)
+            import threading
 
-                # Create repo if it doesn't exist
+            def _upload():
                 try:
-                    create_repo(repo_id, repo_type="model", private=True, token=token, exist_ok=True)
-                except Exception:
-                    pass
+                    from huggingface_hub import HfApi, create_repo
+                    token = getattr(self.training_config, "hub_token", None) or os.getenv("HF_TOKEN")
+                    repo_id = self.training_config.hub_repo_id
+                    api = HfApi(token=token)
+                    try:
+                        create_repo(repo_id, repo_type="model", private=True, token=token, exist_ok=True)
+                    except Exception:
+                        pass
+                    hub_path = f"{stage}/{filename}"
+                    print(f"☁️  [BG] Uploading to HF Hub: {repo_id}/{hub_path} ...")
+                    api.upload_file(
+                        path_or_fileobj=str(path),
+                        path_in_repo=hub_path,
+                        repo_id=repo_id,
+                        repo_type="model",
+                        commit_message=f"[{stage}] {'Final' if final else f'Epoch {epoch+1}'} checkpoint"
+                    )
+                    print(f"✅ [BG] Uploaded to HF Hub: https://huggingface.co/{repo_id}")
+                    self._cleanup_old_checkpoints(stage, checkpoint_dir, keep_count=2)
+                except Exception as e:
+                    print(f"⚠️  HF Hub upload failed — keeping local copy: {e}")
 
-                # Upload checkpoint file
-                hub_path = f"{stage}/{filename}"
-                print(f"☁️  Uploading to HF Hub: {repo_id}/{hub_path} ...")
-                api.upload_file(
-                    path_or_fileobj=str(path),
-                    path_in_repo=hub_path,
-                    repo_id=repo_id,
-                    repo_type="model",
-                    commit_message=f"[{stage}] {'Final' if final else f'Epoch {epoch+1}'} checkpoint"
-                )
-                print(f"✅ Uploaded to HF Hub: https://huggingface.co/{repo_id}")
-                
-                # Now aggressively delete old local checkpoints to save space
-                self._cleanup_old_checkpoints(stage, checkpoint_dir, keep_count=2)
-
-            except Exception as e:
-                print(f"⚠️  HF Hub upload failed — keeping local copy: {e}")
+            threading.Thread(target=_upload, daemon=True).start()
         else:
             print("ℹ️  push_to_hub=False, checkpoint kept locally only.")
 
