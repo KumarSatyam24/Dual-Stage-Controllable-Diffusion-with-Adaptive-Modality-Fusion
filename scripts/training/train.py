@@ -304,6 +304,14 @@ class RAGAFDiffusionTrainer:
         else:
             raise ValueError(f"Unknown dataset: {self.data_config.dataset_name}")
         
+        # Subsample training dataset if limited (e.g., for faster Stage 2 iterations)
+        dataset_limit = getattr(self.training_config, "dataset_limit", None)
+        if dataset_limit and dataset_limit < len(train_dataset):
+            print(f"📊 Subsampling training set: {len(train_dataset)} -> {dataset_limit} samples")
+            indices = torch.randperm(len(train_dataset))[:dataset_limit]
+            from torch.utils.data import Subset
+            train_dataset = Subset(train_dataset, indices)
+
         # Create train dataloader
         self.train_dataloader = DataLoader(
             train_dataset,
@@ -346,9 +354,22 @@ class RAGAFDiffusionTrainer:
                 collate_fn=collate
             )
             print(f"Val dataset loaded: {len(val_dataset)} samples")
+
+            # Create fixed validation batch for consistent monitoring (100 images)
+            print("Creating fixed validation subset (100 samples)...")
+            self.fixed_val_samples = []
+            fixed_count = 0
+            for batch in self.val_dataloader:
+                self.fixed_val_samples.append(batch)
+                fixed_count += batch["photo"].shape[0]
+                if fixed_count >= 100:
+                    break
+            print(f"✅ Fixed validation subset ready: {fixed_count} samples")
+
         except Exception as e:
             print(f"Warning: Could not create val dataloader ({e}). Falling back to train set for validation.")
             self.val_dataloader = self.train_dataloader
+            self.fixed_val_samples = []
 
         print(f"Dataset loaded: {len(train_dataset)} samples")
     
@@ -511,8 +532,8 @@ class RAGAFDiffusionTrainer:
         with torch.no_grad():
             sketch_features = self.stage1_model.encode_sketch(sketches)
             text_embeddings = self.stage1_model.encode_text(text_prompts)
-            # Use 10 steps for better quality stage1 conditioning during training
-            stage1_latents = self._generate_stage1_latents(sketch_features, text_embeddings, num_steps=10)
+            # Use 4 steps for faster Stage 1 conditioning during training (down from 10)
+            stage1_latents = self._generate_stage1_latents(sketch_features, text_embeddings, num_steps=4)
 
             # Encode Ground Truth to latents
             gt_latents = self.vae.encode(photos).latent_dist.sample() * 0.18215
@@ -528,13 +549,11 @@ class RAGAFDiffusionTrainer:
         # 3. Forward through Stage 2 with Stage-1 conditioning
         # Get region graph (handle batch)
         region_graphs = batch["region_graph"]
-        # Use the first one for now or loop (Simplified for performance)
-        region_graph = region_graphs[0] if isinstance(region_graphs, list) else region_graphs
         
         output_dict = stage2_model(
             noisy_latents,
             timesteps,
-            region_graph,
+            region_graphs,
             text_embeddings,
             stage1_latents=stage1_latents,
             return_dict=True
@@ -563,18 +582,30 @@ class RAGAFDiffusionTrainer:
         # C. Perceptual Loss (LPIPS) and L_delta
         # Decode pred and stage1 latents in a single batched VAE call
         with torch.set_grad_enabled(True):
+            self._s2_step_count = getattr(self, "_s2_step_count", 0) + 1
             combined_latents = torch.cat([pred_x0_latents, stage1_latents], dim=0) / 0.18215
-            combined_images = self.vae.decode(combined_latents).sample
-            combined_images = torch.clamp(combined_images, -1, 1)
-            b = pred_x0_latents.shape[0]
-            pred_images = combined_images[:b]
-            s1_images = combined_images[b:].detach()
+            if self._s2_step_count % 100 == 0:
+                with torch.no_grad():
+                    combined_images = self.vae.decode(combined_latents).sample
+                combined_images = torch.clamp(combined_images, -1, 1)
+                
+                b = pred_x0_latents.shape[0]
+                pred_images = combined_images[:b]
+                s1_images = combined_images[b:].detach()
 
-            # Compute LPIPS between pred and ground truth
-            loss_perceptual = self.lpips_loss(pred_images, photos).mean()
+                loss_perceptual = self.lpips_loss(pred_images, photos).mean()
+                image_delta = pred_images - s1_images
+                loss_delta = torch.mean(torch.abs(image_delta))
+            else:
+                pred_images = None
+                s1_images = None
+                loss_perceptual = torch.tensor(0.0, device=photos.device)
+                loss_delta = torch.tensor(0.0, device=photos.device)
+                
 
-            image_delta = pred_images - s1_images
-            loss_delta = torch.mean(torch.abs(image_delta))
+            
+        
+        
         
         # Final combined loss
         # Use configurable weights from training_config
@@ -591,7 +622,7 @@ class RAGAFDiffusionTrainer:
         
         # Compute Stage-2 metrics — CPU-heavy, gated to every 10 steps
         self._s2_step_count = getattr(self, '_s2_step_count', 0) + 1
-        if self._s2_step_count % 10 == 0:
+        if self._s2_step_count % 10 == 0 and pred_images is not None:
             s2_ssim, s2_psnr = self.compute_metrics(pred_images.detach(), photos)
             s1_ssim, s1_psnr = self.compute_metrics(s1_images.detach(), photos)
             edge_sim = self.compute_edge_similarity(pred_images.detach(), s1_images.detach())
@@ -622,70 +653,116 @@ class RAGAFDiffusionTrainer:
             }
         }
     
-    def validate_stage2(self, model, num_samples: int = 4) -> Dict[str, float]:
-        """
-        Validate Stage 2 on the held-out val set.
+    def _generate_stage2_latents(self, stage2_model, stage1_latents, region_graphs, text_embeddings, num_steps=10):
+        """Perform full multi-step refinement for Stage 2 (inference mode)."""
+        batch_size = stage1_latents.shape[0]
+        device = stage1_latents.device
+        
+        # Start from pure noise
+        latents = torch.randn_like(stage1_latents)
+        self.ddim_scheduler.set_timesteps(num_steps)
+        
+        for t in self.ddim_scheduler.timesteps:
+            latent_model_input = self.ddim_scheduler.scale_model_input(latents, t)
+            
+            # Stage 2 takes stage1_latents as conditioning
+            noise_pred = stage2_model(
+                latent_model_input,
+                t.to(device),
+                region_graphs,
+                text_embeddings,
+                stage1_latents=stage1_latents,
+                return_dict=True
+            )["noise_pred"]
+            
+            latents = self.ddim_scheduler.step(noise_pred, t, latents).prev_sample
+            
+        return latents
 
-        Args:
-            model: Stage 2 model
-            num_samples: Max samples to evaluate (uses first batch up to this limit)
-
-        Returns:
-            Dict with validation metrics
+    def validate_stage2(self, model) -> Dict:
         """
-        model.eval()
+        Validate Stage 2 by performing FULL inference (starting from noise)
+        to prevent ground-truth leakage in visual reports.
+        """
+        # Unwrap model for inference
+        model_to_eval = self.accelerator.unwrap_model(model)
+        model_to_eval.eval()
         device = self.accelerator.device
-        val_loss = 0.0
-
+        
+        all_metrics = {
+            "val_loss": [],
+            "val_s2_ssim": [],
+            "val_s2_psnr": [],
+            "val_s1_ssim": [],
+            "val_s1_psnr": [],
+            "val_edge_sim": []
+        }
+        
+        # Store a few images for visualization (first 8 samples)
+        viz_images = {"sketch": [], "s1": [], "s2": [], "gt": []}
+        
         with torch.no_grad():
-            for batch_idx, batch in enumerate(self.val_dataloader):
-                if batch_idx >= 1:  # 1 batch is enough for a quick val signal
-                    break
-
+            for batch in self.fixed_val_samples:
                 photos = batch["photo"].to(device)
+                sketches = batch["sketch"].to(device)
                 text_prompts = batch["text_prompt"]
                 region_graphs = batch["region_graph"]
+                bs = photos.shape[0]
 
-                # Trim to num_samples
-                bs = min(num_samples, photos.shape[0])
-                photos = photos[:bs]
-                text_prompts = text_prompts[:bs]
-                region_graphs = region_graphs[:bs] if isinstance(region_graphs, list) else region_graphs
+                # 1. Full Stage-1 Generation (Starting from noise)
+                sketch_features = self.stage1_model.encode_sketch(sketches)
+                text_embeddings = self.stage1_model.encode_text(text_prompts)
+                s1_latents = self._generate_stage1_latents(sketch_features, text_embeddings, num_steps=10)
+                s1_images = self.vae.decode(s1_latents / 0.18215).sample
+                s1_images = torch.clamp(s1_images, -1, 1)
 
-                # Encode images
-                latents = self.vae.encode(photos).latent_dist.sample() * 0.18215
-
-                # Sample noise
-                noise = torch.randn_like(latents)
-                timesteps = torch.randint(
-                    0, self.noise_scheduler.config.num_train_timesteps,
-                    (bs,), device=device
+                # 2. Full Stage-2 Refinement (Starting from noise, NOT noisy GT)
+                # This ensures the visual report shows the model's ACTUAL generation ability
+                # Slice region_graphs for current batch
+                current_graphs = region_graphs[:bs] if isinstance(region_graphs, list) else region_graphs
+                
+                s2_latents = self._generate_stage2_latents(
+                    model_to_eval, s1_latents, current_graphs, text_embeddings, num_steps=10
                 )
-                noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
+                pred_images = self.vae.decode(s2_latents / 0.18215).sample
+                pred_images = torch.clamp(pred_images, -1, 1)
 
-                # Encode text
-                text_inputs = self.tokenizer(
-                    text_prompts,
-                    padding="max_length",
-                    max_length=self.tokenizer.model_max_length,
-                    truncation=True,
-                    return_tensors="pt"
-                )
-                text_embeddings = self.text_encoder(text_inputs.input_ids.to(device))[0]
+                # Metrics (compare prediction against ground truth)
+                s2_ssim, s2_psnr = self.compute_metrics(pred_images, photos)
+                s1_ssim, s1_psnr = self.compute_metrics(s1_images, photos)
+                edge_sim = self.compute_edge_similarity(pred_images, s1_images)
+                
+                # Still calculate loss for tracking (needs GT-based noise prediction)
+                gt_latents = self.vae.encode(photos).latent_dist.sample() * 0.18215
+                torch.manual_seed(42)
+                noise = torch.randn_like(gt_latents)
+                t_val = torch.ones((bs,), device=device, dtype=torch.long) * 500
+                noisy_gt = self.noise_scheduler.add_noise(gt_latents, noise, t_val)
+                noise_pred = model_to_eval(noisy_gt, t_val, current_graphs, text_embeddings, stage1_latents=s1_latents)["noise_pred"]
+                
+                all_metrics["val_loss"].append(F.mse_loss(noise_pred, noise).item())
+                all_metrics["val_s2_ssim"].append(s2_ssim)
+                all_metrics["val_s2_psnr"].append(s2_psnr)
+                all_metrics["val_s1_ssim"].append(s1_ssim)
+                all_metrics["val_s1_psnr"].append(s1_psnr)
+                all_metrics["val_edge_sim"].append(edge_sim)
+                
+                # Viz subset (max 8)
+                if len(viz_images["gt"]) < 8:
+                    rem = 8 - len(viz_images["gt"])
+                    viz_images["sketch"].append(sketches[:rem].cpu())
+                    viz_images["s1"].append(s1_images[:rem].cpu())
+                    viz_images["s2"].append(pred_images[:rem].cpu())
+                    viz_images["gt"].append(photos[:rem].cpu())
 
-                # Single batched forward pass (no per-sample loop)
-                output = model(
-                    noisy_latents,
-                    timesteps,
-                    region_graphs[0] if isinstance(region_graphs, list) else region_graphs,
-                    text_embeddings,
-                    return_dict=True
-                )
-                noise_pred = output["noise_pred"]
-                val_loss = F.mse_loss(noise_pred, noise).item()
-
+        # Average metrics
+        avg_metrics = {k: float(np.mean(v)) for k, v in all_metrics.items()}
+        
+        # Concat viz images
+        viz_grid = {k: torch.cat(v, dim=0) for k, v in viz_images.items()}
+        
         model.train()
-        return {"val_loss": val_loss}
+        return {"avg_metrics": avg_metrics, "viz_images": viz_grid}
 
     
     def train(self):
@@ -895,74 +972,80 @@ class RAGAFDiffusionTrainer:
                         # Clamp residual_alpha ∈ [0.05, 0.5]
                         unwrapped_model.residual_alpha = max(0.05, min(0.5, unwrapped_model.residual_alpha))
                 
-                # Detailed Logging
+                # Minimal Logging
                 if global_step % self.training_config.log_every_n_steps == 0:
                     avg_loss = epoch_loss / (step + 1)
                     lr = lr_scheduler.get_last_lr()[0]
-                    
                     logs = {
                         f"{stage}/loss": avg_loss,
                         f"{stage}/lr": lr,
                     }
-                    if "metrics" in outputs:
-                        for k, v in outputs["metrics"].items():
-                            logs[f"{stage}/{k}"] = v
-                    
                     if self.training_config.use_wandb and self.accelerator.is_main_process:
                         import wandb
                         wandb.log(logs)
-                    
+
                     progress_bar.set_postfix({
                         "loss": f"{avg_loss:.4f}",
-                        "s2_ssim": f"{np.mean(epoch_ssim) if epoch_ssim else 0:.3f}"
                     })
 
-                # Visual Validation (every 500 steps)
-                if self.accelerator.is_main_process and global_step % 500 == 0 and "images" in outputs:
-                    self.save_visual_grid(outputs["images"], stage, global_step)
-            
-            # End of Epoch Evaluation and Diagnostics
-            avg_train_ssim = np.mean(epoch_ssim) if epoch_ssim else 0.0
-            
-            # Validation Step for Overfitting Detection
-            val_metrics = self.validate_stage2(model)
-            avg_val_ssim = val_metrics.get("val_ssim", 0.0)
-            
-            if self.accelerator.is_main_process:
-                print(f"\n[Epoch {epoch+1}] Train SSIM: {avg_train_ssim:.4f}, Val SSIM: {avg_val_ssim:.4f}")
-                
-                # Overfitting detection
-                if avg_train_ssim > avg_val_ssim + 0.1:
-                    print(f"🚨 [WARNING] Stage-2 Overfitting detected! (Train SSIM={avg_train_ssim:.3f}, Val SSIM={avg_val_ssim:.3f})")
+            # 1. Save periodic checkpoint FIRST (as requested)
+            if (epoch + 1) % self.training_config.save_every_n_epochs == 0:
+                self.save_checkpoint(stage, model, epoch)
 
-                # Identity Sanity Check (Stage 2)
-                id_err = 0.0
-                if stage == "stage2":
+            # 2. End of Epoch Evaluation and Diagnostics
+            if stage == "stage2":
+                print(f"\n[Epoch {epoch+1}] Running validation on fixed subset...")
+                val_results = self.validate_stage2(model)
+                avg_metrics = val_results["avg_metrics"]
+                avg_val_ssim = avg_metrics["val_s2_ssim"]
+
+                if self.accelerator.is_main_process:
+                    print(f"✅ Val SSIM: {avg_val_ssim:.4f}, Val LPIPS-Loss: {avg_metrics['val_loss']:.4f}")
+
+                    # Log to WandB
+                    if self.training_config.use_wandb:
+                        import wandb
+                        # Log metrics
+                        wandb_logs = {f"val/{k}": v for k, v in avg_metrics.items()}
+                        wandb_logs["epoch"] = epoch + 1
+
+                        # Log images
+                        viz = val_results["viz_images"]
+                        sketches = viz["sketch"].repeat(1, 3, 1, 1) if viz["sketch"].shape[1] == 1 else viz["sketch"]
+                        if sketches.max() <= 1.0: sketches = sketches * 2 - 1
+
+                        combined = torch.cat([sketches, viz["s1"], viz["s2"], viz["gt"]], dim=0)
+                        grid = make_grid(combined, nrow=viz["gt"].shape[0], normalize=True, value_range=(-1, 1))
+
+                        wandb_logs["visuals/comparison"] = wandb.Image(grid, caption=f"Epoch {epoch+1}: Sketch | Stage-1 | Stage-2 (Refined) | Ground Truth")
+                        wandb.log(wandb_logs)
+
+                    # Identity Sanity Check (Stage 2)
                     id_err = run_identity_check(model)
                     print(f"[Identity Check] Error: {id_err:.6f}")
 
-                # Save comparison log for this epoch
-                curr_alpha = getattr(self.accelerator.unwrap_model(model), "residual_alpha", 0.0)
-                self.alpha_history.append(curr_alpha)
+                    # Save comparison log for this epoch
+                    curr_alpha = float(getattr(self.accelerator.unwrap_model(model), "residual_alpha", 0.0))
+                    epoch_log = {
+                        "epoch": epoch + 1,
+                        "ssim_val": float(avg_val_ssim),
+                        "identity_error": id_err,
+                        "residual_alpha": curr_alpha,
+                        **avg_metrics
+                    }
+                    comparison_history.append(epoch_log)
 
-                epoch_log = {
-                    "epoch": epoch + 1,
-                    "ssim_train": avg_train_ssim,
-                    "ssim_val": avg_val_ssim,
-                    "delta_ssim": avg_train_ssim - (outputs["metrics"]["s1_ssim"] if "metrics" in outputs else 0),
-                    "identity_error": id_err,
-                    "delta_mean_avg": np.mean(epoch_delta_means) if epoch_delta_means else 0,
-                    "running_delta_mean_ema": self.running_delta_mean,
-                    "residual_alpha": curr_alpha
-                }
-                comparison_history.append(epoch_log)
-                
-                log_path = Path(self.training_config.checkpoint_dir) / stage / "comparison_logs.json"
-                with open(log_path, "w") as f:
-                    json.dump(comparison_history, f, indent=2)
+                    log_path = Path(self.training_config.checkpoint_dir) / stage / "comparison_logs.json"
+                    log_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(log_path, "w") as f:
+                        json.dump(comparison_history, f, indent=2)
 
-            # Save Best Model (based on Val SSIM if available, else Train)
-            eval_metric = avg_val_ssim if avg_val_ssim > 0 else avg_train_ssim
+                eval_metric = avg_val_ssim
+            else:
+                # Stage 1: simpler val
+                eval_metric = 0 # Implement if needed
+
+            # Save Best Model
             if eval_metric > best_ssim:
                 best_ssim = eval_metric
                 patience_counter = 0
@@ -970,15 +1053,12 @@ class RAGAFDiffusionTrainer:
                 self.save_checkpoint(stage, model, epoch, filename=f"best_{stage}.pt")
             else:
                 patience_counter += 1
+
                 
             # Early Stopping
             if patience_counter >= patience:
                 print(f"🛑 Early stopping triggered after {patience} epochs without SSIM improvement.")
                 break
-
-            # Save periodic checkpoint
-            if (epoch + 1) % self.training_config.save_every_n_epochs == 0:
-                self.save_checkpoint(stage, model, epoch)
         
         # Save final checkpoint
         self.save_checkpoint(stage, model, num_epochs, final=True)
@@ -1151,6 +1231,9 @@ def main():
     parser.add_argument("--learning_rate", type=float, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--checkpoint_dir", type=str, default=None)
+    parser.add_argument("--grad_accum", type=int, default=None, help="Gradient accumulation steps")
+    parser.add_argument("--save_every", type=int, default=None, help="Save checkpoint every N epochs")
+    parser.add_argument("--dataset_limit", type=int, default=None, help="Limit training dataset to N samples")
     parser.add_argument("--resume_epoch", type=int, default=0,
                         help="Resume stage1 training from this epoch (e.g. 4 to skip epochs 1-4)")
     
@@ -1176,10 +1259,47 @@ def main():
         config["training"].stage2_epochs = args.epochs
     if args.checkpoint_dir is not None:
         config["training"].checkpoint_dir = args.checkpoint_dir
+    if args.grad_accum is not None:
+        config["training"].gradient_accumulation_steps = args.grad_accum
+    if args.save_every is not None:
+        config["training"].save_every_n_epochs = args.save_every
+    if args.dataset_limit is not None:
+        config["training"].dataset_limit = args.dataset_limit
     if args.resume_epoch > 0:
         config["training"].resume_from_epoch = args.resume_epoch
         print(f"▶️  Will resume Stage 1 from epoch {args.resume_epoch}")
     
+    # Check for WandB availability
+    try:
+        import wandb
+        wandb_available = True
+    except ImportError:
+        wandb_available = False
+
+    # Force WandB for this run if available
+    if wandb_available:
+        config["training"].use_wandb = True
+    else:
+        config["training"].use_wandb = False
+        print("⚠️  WandB not installed. Logging to local logs only.")
+    
+    # Print configuration summary
+    print("\n" + "=" * 40)
+    print("🚀 FINAL TRAINING CONFIGURATION")
+    print("-" * 40)
+    print(f"  Stage:           {config['training'].train_stage}")
+    print(f"  Batch Size:      {config['data'].batch_size}")
+    print(f"  Grad Accum:      {config['training'].gradient_accumulation_steps}")
+    print(f"  Effective Batch: {config['data'].batch_size * config['training'].gradient_accumulation_steps}")
+    print(f"  Dataset Limit:   {getattr(config['training'], 'dataset_limit', 'Full')}")
+    print(f"  Learning Rate:   {config['training'].learning_rate}")
+    print(f"  Epochs:          {config['training'].stage1_epochs if config['training'].train_stage == 'stage1' else config['training'].stage2_epochs}")
+    print(f"  Image Size:      {config['data'].image_size}")
+    print(f"  Precision:       {config['training'].mixed_precision}")
+    print(f"  LPIPS Loss:      {config['training'].lambda_lpips > 0}")
+    print(f"  WandB:           {'Enabled ✅' if config['training'].use_wandb else 'Disabled ❌'}")
+    print("=" * 40 + "\n")
+
     # Create trainer
     trainer = RAGAFDiffusionTrainer(
         model_config=config["model"],

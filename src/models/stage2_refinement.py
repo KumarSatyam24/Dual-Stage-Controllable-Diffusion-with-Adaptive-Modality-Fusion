@@ -16,7 +16,7 @@ Author: RAGAF-Diffusion Research Team
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 from diffusers import UNet2DConditionModel
 
 from src.models.ragaf_attention import RAGAFAttentionModule
@@ -194,7 +194,7 @@ class Stage2SemanticRefinement(nn.Module):
         self,
         latents: torch.Tensor,
         timestep: torch.Tensor,
-        region_graph: RegionGraph,
+        region_graph: Union[RegionGraph, List[RegionGraph]],
         text_embeddings: torch.Tensor,
         stage1_latents: Optional[torch.Tensor] = None,
         return_dict: bool = False
@@ -205,7 +205,7 @@ class Stage2SemanticRefinement(nn.Module):
         Args:
             latents: Noisy latents (B, 4, H/8, W/8)
             timestep: Diffusion timestep (B,) or scalar
-            region_graph: RegionGraph object
+            region_graph: RegionGraph object or list of RegionGraph objects
             text_embeddings: Text embeddings (B, T, text_dim) where B is batch size
             stage1_latents: Optional Stage-1 latents for conditioning (B, 4, H/8, W/8)
             return_dict: Whether to return detailed dict
@@ -215,40 +215,108 @@ class Stage2SemanticRefinement(nn.Module):
         """
         batch_size = latents.shape[0]
         device = latents.device
+        dtype = latents.dtype
+        H, W = latents.shape[2:]
         
-        # Strengthen conditioning on Stage-1
+        # 1. Handle Stage-1 conditioning
         if self.concatenate_stage1:
             if stage1_latents is None:
-                # Fallback to zeros (not ideal for training, but prevents crash)
                 stage1_latents = torch.zeros_like(latents)
             unet_input = torch.cat([latents, stage1_latents], dim=1)  # (B, 8, H/8, W/8)
         else:
             unet_input = latents
 
-        # Ensure text_embeddings is properly batched (B, 77, 768)
+        # 2. Ensure text_embeddings is properly batched
         if text_embeddings.dim() == 2:
             text_embeddings = text_embeddings.unsqueeze(0).expand(batch_size, -1, -1)
         
-        # Get text features (mean over tokens)
-        text_features = text_embeddings.mean(1)  # (B, 768)
-        
-        # Project to hidden dim if needed
-        if text_features.shape[-1] != self.hidden_dim:
-            if not hasattr(self, 'text_proj'):
-                self.text_proj = nn.Linear(text_features.shape[-1], self.hidden_dim).to(device)
-            fused_region_features = self.text_proj(text_features)
+        # 3. Process each item in batch for region-aware features
+        if isinstance(region_graph, RegionGraph):
+            region_graphs = [region_graph] * batch_size
         else:
-            fused_region_features = text_features
-        
-        # Project region features to latent space (Residual component)
-        feature_modulation = self.feature_projection(fused_region_features)  # (B, 4)
-        feature_modulation = feature_modulation.view(batch_size, 4, 1, 1)
+            region_graphs = region_graph
+
+        batch_fused_features = []
+        batch_modulation_map = torch.zeros_like(latents)
+
+        for i in range(batch_size):
+            rg = region_graphs[i]
+            if rg.num_nodes == 0:
+                # Handle empty graph: use global text features as fallback
+                text_feat = text_embeddings[i].mean(0) # (D,)
+                if text_feat.shape[-1] != self.hidden_dim:
+                    if not hasattr(self, 'text_proj'):
+                        self.text_proj = nn.Linear(text_feat.shape[-1], self.hidden_dim).to(device)
+                    fused = self.text_proj(text_feat)
+                else:
+                    fused = text_feat
+                
+                # Global modulation
+                mod = self.feature_projection(fused) # (4,)
+                batch_modulation_map[i] = mod.view(4, 1, 1).expand(4, H, W)
+                batch_fused_features.append(fused.unsqueeze(0))
+                continue
+
+            # Move graph components to device
+            rg.node_features = rg.node_features.to(device)
+            rg.edge_index = rg.edge_index.to(device)
+            if rg.edge_weights is not None:
+                rg.edge_weights = rg.edge_weights.to(device)
+
+            # RAGAF Attention: text-aligned region features
+            text_region_features, _ = self.ragaf_attention(rg, text_embeddings[i]) # (N, hidden_dim)
+
+            # Sketch features from graph nodes (projected)
+            sketch_region_features = self.ragaf_attention.node_embedding(rg.node_features) # (N, hidden_dim)
+
+            # Adaptive Fusion
+            # timestep for this item
+            t_i = timestep[i] if timestep.dim() > 0 else timestep
+            fused_features, _ = self.adaptive_fusion(
+                sketch_region_features,
+                text_region_features,
+                t_i
+            ) # (B=1, N, hidden_dim)
+            fused_features = fused_features.squeeze(0) # (N, hidden_dim)
+
+            # Refinement MLP (inside fuse_modalities-like logic)
+            fused_features = fused_features + self.refinement_mlp(fused_features)
+            batch_fused_features.append(fused_features)
+
+            # Project to latent modulation
+            region_modulations = self.feature_projection(fused_features) # (N, 4)
+            # print(f"DEBUG: fused_features shape: {fused_features.shape}, region_modulations shape: {region_modulations.shape}")
+
+            # Create spatial modulation map using masks
+            for j, mask_np in enumerate(rg.region_masks):
+                if j >= rg.num_nodes: break
+                
+                # Convert mask to tensor and resize
+                mask = torch.from_numpy(mask_np).to(device=device, dtype=dtype)
+                mask_resized = F.interpolate(
+                    mask.unsqueeze(0).unsqueeze(0),
+                    size=(H, W),
+                    mode='nearest'
+                ).squeeze() # (H, W)
+                
+                # Inject region modulation
+                # (4,) * (H, W) -> (4, H, W)
+                # print(f"DEBUG: j={j}, region_modulations[j] shape: {region_modulations[j].shape}")
+                batch_modulation_map[i] += region_modulations[j].view(4, 1, 1) * mask_resized
+
+        # 4. Apply modulation to UNet input or latents
+        # Based on checklist: conditioned_latents = latents + alpha * fused_latents
+        # We apply it to the latents part of unet_input
+        if self.concatenate_stage1:
+            unet_input[:, :4] = unet_input[:, :4] + self.residual_alpha * batch_modulation_map
+        else:
+            unet_input = unet_input + self.residual_alpha * batch_modulation_map
         
         # Ensure timestep is proper shape for UNet: (B,)
         if timestep.dim() == 0:
             timestep = timestep.unsqueeze(0).expand(batch_size)
         
-        # Standard UNet forward with conditioned input
+        # 5. Standard UNet forward
         noise_pred = self.unet(
             unet_input,
             timestep,
@@ -256,22 +324,12 @@ class Stage2SemanticRefinement(nn.Module):
             return_dict=False
         )[0]
         
-        # Apply residual scaling if requested: output = stage1 + alpha * delta
-        # Here we can interpret the noise_pred as the delta or add the feature modulation
-        if self.use_residual and stage1_latents is not None:
-            # We add the scaled feature modulation as a refinement to the noisy latents
-            # or we can treat the entire noise_pred as a delta.
-            # Scaling the contribution to stabilize training.
-            noise_pred = noise_pred + self.residual_alpha * feature_modulation
         
-        if return_dict:
-            return {
-                "noise_pred": noise_pred,
-                "feature_modulation": feature_modulation,
-                "fused_features": fused_region_features
-            }
-        else:
-            return noise_pred
+        return {
+            "noise_pred": noise_pred,
+            "modulation_map": batch_modulation_map,
+            "fused_features": batch_fused_features
+        }
 
     def predict_latent_delta(self, unet_input, timestep, text_embeddings):
         """Explicitly predict the refinement delta for latent space."""
@@ -373,22 +431,58 @@ class Stage2RefinementPipeline:
         # Move to device
         stage1_image = stage1_image.to(self.device)
         
-        # Encode to latents
+        # 1. Encode to latents
         stage1_image_normalized = stage1_image * 2 - 1  # [0,1] -> [-1,1]
-        latents = self.vae.encode(stage1_image_normalized).latent_dist.sample()
-        latents = latents * 0.18215
+        stage1_latents = self.vae.encode(stage1_image_normalized).latent_dist.sample()
+        stage1_latents = stage1_latents * 0.18215
         
-        # Add noise based on strength
-        # Higher strength = more noise = more refinement
-        # TODO: Implement proper noising schedule for refinement
+        # 2. Setup scheduler and timesteps
+        # We only run for a fraction of steps based on strength
+        # (similar to Stable Diffusion img2img)
+        from diffusers import DDIMScheduler
+        scheduler = DDIMScheduler.from_pretrained(
+            "runwayml/stable-diffusion-v1-5", subfolder="scheduler"
+        )
+        scheduler.set_timesteps(self.num_inference_steps)
         
-        # For now, just return the Stage 1 output
-        # Full implementation would run refinement diffusion loop
+        # Determine starting timestep
+        init_timestep = int(self.num_inference_steps * strength)
+        timesteps = scheduler.timesteps[-init_timestep:]
         
-        print(f"Stage 2 refinement with strength {strength}")
-        print("TODO: Implement full refinement diffusion loop")
+        # 3. Add noise to Stage 1 latents
+        noise = torch.randn_like(stage1_latents)
+        latents = scheduler.add_noise(stage1_latents, noise, timesteps[0])
         
-        return stage1_image
+        # 4. Denoising loop
+        for t in timesteps:
+            # Scale model input
+            latent_model_input = scheduler.scale_model_input(latents, t)
+            
+            # Predict noise
+            # We pass stage1_latents as conditioning to the Stage 2 model
+            noise_pred = self.model(
+                latent_model_input,
+                t.to(self.device),
+                region_graph,
+                text_embeddings,
+                stage1_latents=stage1_latents,
+                return_dict=False
+            )
+            
+            # Perform guidance (if needed)
+            # For simplicity, we assume text_embeddings already contains guidance if requested
+            
+            # Step scheduler
+            latents = scheduler.step(noise_pred, t, latents).prev_sample
+            
+        # 5. Decode refined latents
+        latents = 1 / 0.18215 * latents
+        image = self.vae.decode(latents).sample
+        image = (image / 2 + 0.5).clamp(0, 1)
+        
+        print(f"Stage 2 refinement complete with strength {strength}")
+        
+        return image
 
 
 if __name__ == "__main__":
