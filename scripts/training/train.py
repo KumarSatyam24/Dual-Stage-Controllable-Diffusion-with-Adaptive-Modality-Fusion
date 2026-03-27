@@ -548,13 +548,13 @@ class RAGAFDiffusionTrainer:
 
 
 
-        #if torch.rand(1)<0.95:
-        #    base_latents = stage1_latents.detach()
-        #else:
-        #    base_latents = gt_latents
+        if torch.rand(1)<0.7:
+            base_latents = stage1_latents.detach()
+        else:
+            base_latents = (0.5 * gt_latents + 0.5 * stage1_latents).detach()
             
             
-        base_latents = stage1_latents.detach() #comment this if necessary
+        #base_latents = stage1_latents.detach() #comment this if necessary
         noise = torch.randn_like(base_latents)
         noisy_latents = self.noise_scheduler.add_noise(base_latents, noise, timesteps)
 
@@ -589,7 +589,7 @@ class RAGAFDiffusionTrainer:
         
         # B. Identity Preservation Loss (L1)
         # Encourage Stage-2 to stay close to Stage-1 structure
-        loss_identity = F.l1_loss(pred_x0_latents, stage1_latents)
+        loss_identity = (0.5 * F.l1_loss(pred_x0_latents, stage1_latents)+ 0.5 * F.mse_loss(pred_x0_latents, stage1_latents))
         
         # C. Perceptual Loss (LPIPS) and L_delta
         # Decode pred and stage1 latents in a single batched VAE call
@@ -624,12 +624,38 @@ class RAGAFDiffusionTrainer:
         lambda_id = getattr(self.training_config, "lambda_identity", 0.2)
         lambda_lpips = getattr(self.training_config, "lambda_lpips", 0.1)
         lambda_delta = getattr(self.training_config, "lambda_delta", 0.05)
+
+        # --- Decode predicted image for SSIM ---
+        with torch.no_grad():
+            pred_for_ssim = self.vae.decode(pred_x0_latents / 0.18215).sample
+            pred_for_ssim = torch.clamp(pred_for_ssim, -1, 1)
+
+        # Convert to [0,1]
+        pred_ssim = (pred_for_ssim + 1) / 2
+        gt_ssim = (photos + 1) / 2
+
+        # Compute SSIM (batch average)
+        ssim_val = 0
+        for i in range(pred_ssim.shape[0]):
+            ssim_val += ssim(
+                gt_ssim[i].permute(1,2,0).cpu().numpy(),
+                pred_ssim[i].permute(1,2,0).cpu().numpy(),
+                data_range=1.0,
+                channel_axis=2
+            )
+        ssim_val /= pred_ssim.shape[0]
+
+        ssim_loss = 1 - ssim_val
+        ssim_loss = torch.tensor(ssim_loss, device=photos.device)
         
+        lambda_ssim = 0.15
+
         total_loss = (
             loss_diffusion 
             + lambda_id * loss_identity 
             + lambda_lpips * loss_perceptual
             + lambda_delta * loss_delta
+            + lambda_ssim * ssim_loss   
         )
         
         # Compute Stage-2 metrics — CPU-heavy, gated to every 10 steps
@@ -806,7 +832,7 @@ class RAGAFDiffusionTrainer:
                 lr_scheduler=self.lr_scheduler_stage2,
                 num_epochs=self.training_config.stage2_epochs,
                 train_step_fn=self.train_stage2_step,
-                start_epoch=0
+                start_epoch=self.training_config.resume_from_epoch
             )
         
         print("\n" + "="*60)
@@ -849,16 +875,25 @@ class RAGAFDiffusionTrainer:
         )
 
         # Resume: load checkpoint weights if start_epoch > 0
-        if start_epoch > 0:
-            resume_path = self._find_resume_checkpoint(stage, start_epoch)
-            if resume_path:
-                print(f"▶️  Resuming from checkpoint: {resume_path}")
-                ckpt = torch.load(resume_path, map_location=self.accelerator.device, weights_only=False)
-                unwrapped = self.accelerator.unwrap_model(model)
-                unwrapped.load_state_dict(ckpt["model_state_dict"])
-                print(f"✅ Loaded weights from epoch {ckpt['epoch']+1}")
-            else:
-                print(f"⚠️  No local checkpoint found for epoch {start_epoch}, starting fresh.")
+        # ✅ NEW RESUME LOGIC (independent of start_epoch)
+        resume_path = getattr(self.training_config, "resume_from_checkpoint", None)
+
+        if resume_path is not None and os.path.exists(resume_path):
+            print(f"▶️ Resuming from checkpoint: {resume_path}")
+    
+            ckpt = torch.load(resume_path, map_location=self.accelerator.device, weights_only=False)
+    
+            unwrapped = self.accelerator.unwrap_model(model)
+            unwrapped.load_state_dict(ckpt["model_state_dict"])
+    
+            # ✅ Set correct start epoch
+            start_epoch = ckpt.get("epoch", 0) + 1
+    
+            print(f"✅ Loaded weights from epoch {ckpt['epoch'] + 1}")
+            print(f"✅ Resuming training from epoch {start_epoch}")
+
+        else:
+            print("⚠️ No checkpoint found. Training from scratch.")
 
         global_step = start_epoch * len(train_dataloader)
         
@@ -960,7 +995,7 @@ class RAGAFDiffusionTrainer:
                     # Cooldown prevents continuous decay when delta is stuck above threshold
                     if global_step % 200 == 0:
                         t_high = getattr(self.training_config, "delta_threshold_high", 0.75)
-                        t_low = getattr(self.training_config, "delta_threshold_low", 0.35)
+                        t_low = getattr(self.training_config, "delta_threshold_low", 0.30)
                         cooldown = getattr(self, "_alpha_cooldown_steps", 0)
 
                         unwrapped_model = self.accelerator.unwrap_model(model)
@@ -973,7 +1008,7 @@ class RAGAFDiffusionTrainer:
                             print(f"\n[Adaptive] EMA Delta ({self.running_delta_mean:.3f}) > {t_high}. Reducing residual_alpha: {old_alpha:.4f} -> {unwrapped_model.residual_alpha:.4f}")
                         elif self.running_delta_mean < t_low and cooldown == 0:
                             # Delta too small — refinement is being suppressed, increase alpha
-                            unwrapped_model.residual_alpha *= 1.05
+                            unwrapped_model.residual_alpha *= 1.02
                             self._alpha_cooldown_steps = 600
                             print(f"\n[Adaptive] EMA Delta ({self.running_delta_mean:.3f}) < {t_low}. Increasing residual_alpha: {old_alpha:.4f} -> {unwrapped_model.residual_alpha:.4f}")
                         else:
@@ -982,7 +1017,7 @@ class RAGAFDiffusionTrainer:
                                 self._alpha_cooldown_steps = max(0, cooldown - 200)
 
                         # Clamp residual_alpha ∈ [0.05, 0.5]
-                        unwrapped_model.residual_alpha = max(0.05, min(0.5, unwrapped_model.residual_alpha))
+                        unwrapped_model.residual_alpha = max(0.05, min(0.25, unwrapped_model.residual_alpha))
                 
                 # Minimal Logging
                 if global_step % self.training_config.log_every_n_steps == 0:
@@ -1248,6 +1283,9 @@ def main():
     parser.add_argument("--dataset_limit", type=int, default=None, help="Limit training dataset to N samples")
     parser.add_argument("--resume_epoch", type=int, default=0,
                         help="Resume stage1 training from this epoch (e.g. 4 to skip epochs 1-4)")
+    parser.add_argument("--stage2_checkpoint",type=int,default=None,help="Path to Stage 2 checkpoint to resume from")
+    
+    parser.add_argument("--resume_checkpoint",type=str,default=None,help="Path to checkpoint to resume from")
     
     args = parser.parse_args()
     
@@ -1280,6 +1318,8 @@ def main():
     if args.resume_epoch > 0:
         config["training"].resume_from_epoch = args.resume_epoch
         print(f"▶️  Will resume Stage 1 from epoch {args.resume_epoch}")
+    if args.resume_checkpoint is not None:
+        config["training"].resume_from_checkpoint = args.resume_checkpoint
     
     # Check for WandB availability
     try:
