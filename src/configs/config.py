@@ -86,7 +86,7 @@ class TrainingConfig:
     stage2_epochs: int = 10   # Increased from 2
     
     # Optimization
-    learning_rate: float = 2e-5
+    learning_rate: float = 1e-5
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     adam_epsilon: float = 1e-8
@@ -94,10 +94,10 @@ class TrainingConfig:
     
     # Learning rate schedule
     lr_scheduler: str = "cosine"  # "constant", "linear", "cosine"
-    lr_warmup_steps: int = 500
+    lr_warmup_steps: int = 50
     
     # Gradient
-    max_grad_norm: float = 1.0
+    max_grad_norm: float = 0.5
     gradient_accumulation_steps: int = 8  # RTX 5090 32GB: batch_size=16 fits without accumulation
 
     # Mixed precision
@@ -110,7 +110,7 @@ class TrainingConfig:
     # Checkpointing
     save_every_n_epochs: int = 1  # Save every 2 epochs → epoch_2, epoch_4, epoch_6, epoch_8, final
     checkpoint_dir: str = "/workspace/checkpoints"
-    resume_from_checkpoint: Optional[str] = "/workspace/checkpoints/stage2/epoch_1.pt"
+    resume_from_checkpoint: Optional[str] = "/workspace/checkpoints/stage2/epoch_2.pt"
     resume_from_epoch: int = 0  # Set to N to resume training from epoch N
     stage1_checkpoint: str = "/workspace/checkpoints/stage1/epoch_18.pt"
 
@@ -120,8 +120,8 @@ class TrainingConfig:
     hub_token: Optional[str] = None  # Uses HF_TOKEN env var if None
     
     # Stage 2 refinement weights
-    lambda_identity: float = 0.5
-    lambda_lpips: float = 0.1
+    lambda_identity: float = 0.3
+    lambda_lpips: float = 0.15
     lambda_delta: float = 0.05  # Regularization on delta magnitude
     
     # Delta magnitude thresholds for adaptive control

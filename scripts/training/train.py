@@ -403,10 +403,11 @@ class RAGAFDiffusionTrainer:
             )
             
             self.lr_scheduler_stage2 = get_scheduler(
-                self.training_config.lr_scheduler,
+                "cosine",
                 optimizer=self.optimizer_stage2,
-                num_warmup_steps=self.training_config.lr_warmup_steps,
-                num_training_steps=len(self.train_dataloader) * self.training_config.stage2_epochs
+                num_warmup_steps=50,
+                num_training_steps = (len(self.train_dataloader) * self.training_config.stage2_epochs) // self.training_config.gradient_accumulation_steps
+                #len(self.train_dataloader) * self.training_config.stage2_epochs
             )
     
     def train_stage1_step(self, batch: Dict, model=None) -> Dict:
@@ -533,7 +534,7 @@ class RAGAFDiffusionTrainer:
             sketch_features = self.stage1_model.encode_sketch(sketches)
             text_embeddings = self.stage1_model.encode_text(text_prompts)
             # Use 4 steps for faster Stage 1 conditioning during training (down from 10)
-            stage1_latents = self._generate_stage1_latents(sketch_features, text_embeddings, num_steps=8)
+            stage1_latents = self._generate_stage1_latents(sketch_features, text_embeddings, num_steps=12)
 
             # Encode Ground Truth to latents
             gt_latents = self.vae.encode(photos).latent_dist.sample() * 0.18215
@@ -596,7 +597,7 @@ class RAGAFDiffusionTrainer:
         with torch.set_grad_enabled(True):
             self._s2_step_count = getattr(self, "_s2_step_count", 0) + 1
             combined_latents = torch.cat([pred_x0_latents, stage1_latents], dim=0) / 0.18215
-            if self._s2_step_count % 50 == 0:
+            if self._s2_step_count % 25 == 0:
                 with torch.no_grad():
                     combined_images = self.vae.decode(combined_latents).sample
                 combined_images = torch.clamp(combined_images, -1, 1)
@@ -621,8 +622,8 @@ class RAGAFDiffusionTrainer:
         
         # Final combined loss
         # Use configurable weights from training_config
-        lambda_id = getattr(self.training_config, "lambda_identity", 0.2)
-        lambda_lpips = getattr(self.training_config, "lambda_lpips", 0.1)
+        lambda_id = getattr(self.training_config, "lambda_identity", 0.30)
+        lambda_lpips = getattr(self.training_config, "lambda_lpips", 0.15) #0.08 to 0.15 during epoch 2
         lambda_delta = getattr(self.training_config, "lambda_delta", 0.05)
 
         # --- Decode predicted image for SSIM ---
@@ -635,20 +636,16 @@ class RAGAFDiffusionTrainer:
         gt_ssim = (photos + 1) / 2
 
         # Compute SSIM (batch average)
-        ssim_val = 0
-        for i in range(pred_ssim.shape[0]):
-            ssim_val += ssim(
-                gt_ssim[i].permute(1,2,0).cpu().numpy(),
-                pred_ssim[i].permute(1,2,0).cpu().numpy(),
-                data_range=1.0,
-                channel_axis=2
-            )
-        ssim_val /= pred_ssim.shape[0]
+        import pytorch_msssim
 
-        ssim_loss = 1 - ssim_val
-        ssim_loss = torch.tensor(ssim_loss, device=photos.device)
+        ssim_loss = 1 - pytorch_msssim.ssim(
+            pred_for_ssim,
+            photos,
+            data_range=2.0,
+            size_average=True
+        )
         
-        lambda_ssim = 0.15
+        lambda_ssim = 0.25 #0.20 to 0.25 during epoch 2
 
         total_loss = (
             loss_diffusion 
@@ -969,7 +966,8 @@ class RAGAFDiffusionTrainer:
                     
                     # Optimizer step
                     optimizer.step()
-                    lr_scheduler.step()
+                    if self.accelerator.sync_gradients:
+                        lr_scheduler.step()
                     optimizer.zero_grad()
                 
                 # Metrics tracking
@@ -1017,7 +1015,7 @@ class RAGAFDiffusionTrainer:
                                 self._alpha_cooldown_steps = max(0, cooldown - 200)
 
                         # Clamp residual_alpha ∈ [0.05, 0.5]
-                        unwrapped_model.residual_alpha = max(0.05, min(0.25, unwrapped_model.residual_alpha))
+                        unwrapped_model.residual_alpha = max(0.05, min(0.30, unwrapped_model.residual_alpha))
                 
                 # Minimal Logging
                 if global_step % self.training_config.log_every_n_steps == 0:
