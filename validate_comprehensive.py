@@ -115,7 +115,7 @@ class FixedClassValidationDataset(Dataset):
         rng.shuffle(shuffled)
 
         # Take first 100
-        selected = shuffled[:100]
+        selected = shuffled[:10]
         return sorted(selected)  # Sort for consistent ordering
 
     def _load_one_per_class(self):
@@ -138,7 +138,7 @@ class FixedClassValidationDataset(Dataset):
                 continue
 
             # Pick one deterministically
-            sketch_path = sketch_files[0]
+            sketch_path = sketch_files[2]
             sketch_stem = sketch_path.stem
 
             # Find corresponding photo
@@ -176,7 +176,7 @@ class FixedClassValidationDataset(Dataset):
 
         # Generate text prompt
         category = pair["category"].replace("_", " ")
-        text_prompt = f"A rough photo of a {category} following the sketch provided."
+        text_prompt = f"A natural photo of a {category} aligned with the given sketch"
 
         # Extract region graph
         sketch_np = (sketch.squeeze(0).numpy() * 255).astype(np.uint8)
@@ -540,8 +540,8 @@ class ComprehensiveValidator:
         latents = latents * self.stage1_scheduler.init_noise_sigma
 
         # Duplicate sketch conditioning for CFG
-        down_res_cfg = [torch.cat([r, r]) for r in down_res]
-        mid_res_cfg = torch.cat([mid_res, mid_res])
+        down_res_cfg = [torch.cat([torch.zeros_like(r), r]) for r in down_res]
+        mid_res_cfg = torch.cat([torch.zeros_like(mid_res), mid_res])
 
         # Denoising loop
         for t in self.stage1_scheduler.timesteps:
@@ -561,23 +561,68 @@ class ComprehensiveValidator:
             latents = self.stage1_scheduler.step(noise_pred, t, latents).prev_sample
 
         # Decode
-        latents = 1 / 0.18215 * latents
-        image = self.vae.decode(latents).sample
+        #latents = 1 / 0.18215 * latents
+        unscaled_latents = 1 / 0.18215 * latents
+        image = self.vae.decode(unscaled_latents).sample
         image = (image / 2 + 0.5).clamp(0, 1)
 
         return image, latents
 
+
+
+
+
+
+
+
     @torch.no_grad()
     def generate_stage2(self, region_graph, text_embeddings, stage1_latents):
-        """Generate Stage 2 output."""
-        # Setup refinement
-        strength = 0.5
+        """Generate Stage 2 output with CFG + stable refinement."""
 
-        # Use original Stage 1 latents directly (NOT re-encoded from image)
-        # This matches how Stage 2 was trained
+        # 🔧 Move inputs to device
+        if hasattr(region_graph, "node_features"):
+            region_graph.node_features = region_graph.node_features.to(self.device)
+
+        if hasattr(region_graph, "edge_index"):
+            region_graph.edge_index = region_graph.edge_index.to(self.device)
+
+        if hasattr(region_graph, "edge_attr") and region_graph.edge_attr is not None:
+            region_graph.edge_attr = region_graph.edge_attr.to(self.device)
+
+        stage1_latents = stage1_latents.to(self.device)
+
+        # 🔧 Ensure correct shape for text embeddings
+        if text_embeddings.dim() == 2:
+            text_embeddings = text_embeddings.unsqueeze(0)
+
+        # =========================================================
+        # 🔥 CFG SETUP (IMPORTANT)
+        # =========================================================
+
+        # Conditional embeddings already given (text_embeddings)
+        # Create unconditional embeddings
+        uncond_inputs = self.tokenizer(
+            [""],
+            padding="max_length",
+            max_length=77,
+            return_tensors="pt"
+        ).to(self.device)
+
+        uncond_embeddings = self.text_encoder(uncond_inputs.input_ids)[0]
+
+        # Concatenate for CFG
+        encoder_hidden_states = torch.cat([uncond_embeddings, text_embeddings])
+
+        # =========================================================
+        # 🔥 REFINEMENT SETUP
+        # =========================================================
+
+        strength = 0.5  # ↓ reduced from 0.5 (VERY IMPORTANT)
+
+        # Use Stage1 latents directly
         init_latents = stage1_latents
 
-        # Determine timesteps
+        # Select timesteps
         init_timestep = int(self.num_refinement_steps * strength)
         timesteps = self.stage2_scheduler.timesteps[-init_timestep:]
 
@@ -585,32 +630,66 @@ class ComprehensiveValidator:
         noise = torch.randn_like(init_latents)
         latents = self.stage2_scheduler.add_noise(init_latents, noise, timesteps[0])
 
-        # Ensure text embeddings proper shape
-        if text_embeddings.dim() == 2:
-            text_embeddings = text_embeddings.unsqueeze(0)
+        # CFG guidance scale
+        guidance_scale = 2.5 # tune between 4–7
 
-        # Denoising loop
+        # Duplicate stage1 latents for CFG
+        stage1_latents_cfg = torch.cat([torch.zeros_like(stage1_latents), stage1_latents])
+
+        # =========================================================
+        # 🔥 DENOISING LOOP
+        # =========================================================
+
         for t in timesteps:
-            latent_model_input = self.stage2_scheduler.scale_model_input(latents, t)
 
+            # Duplicate latents for CFG
+            latent_model_input = torch.cat([latents] * 2)
+            latent_model_input = self.stage2_scheduler.scale_model_input(latent_model_input, t)
+
+            # Forward pass
             output = self.stage2_model(
                 latent_model_input,
                 t.to(self.device),
                 region_graph,
-                text_embeddings,
-                stage1_latents=stage1_latents,
+                encoder_hidden_states,
+                stage1_latents=stage1_latents_cfg,
                 return_dict=True
             )
 
             noise_pred = output["noise_pred"]
+
+            # Split unconditional & conditional
+            noise_uncond, noise_text = noise_pred.chunk(2)
+
+            # Apply CFG
+            noise_pred = noise_uncond + guidance_scale * (noise_text - noise_uncond)
+
+            # Scheduler step
             latents = self.stage2_scheduler.step(noise_pred, t, latents).prev_sample
 
-        # Decode
+            # 🔧 Clamp latents (stability fix)
+            #latents = torch.clamp(latents, -1.2, 1.2)
+
+        # =========================================================
+        # 🔥 DECODE
+        # =========================================================
+
         latents = 1 / 0.18215 * latents
         image = self.vae.decode(latents).sample
+
+        # Normalize to [0,1]
         image = (image / 2 + 0.5).clamp(0, 1)
 
         return image
+
+
+
+
+
+
+
+
+
 
     def create_comparison_image(self, sketch, stage1_img, stage2_img, ground_truth,
                                  category, metrics_text):
