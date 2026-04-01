@@ -10,6 +10,8 @@
 
 **Bridging Structure and Semantics: A Novel Diffusion Framework for Controllable Sketch-to-Image Generation**
 
+**Base AI Model:** [Stable Diffusion v1.5](https://huggingface.co/runwayml/stable-diffusion-v1-5) | [📘 Full Model Details](AI_MODEL_INFO.md)
+
 </div>
 
 ---
