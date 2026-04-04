@@ -35,6 +35,10 @@ lpips
 
 seaborn
 
+# Step 8: Streamlit app
+streamlit>=1.32.0
+streamlit-drawable-canvas>=0.9.3
+
 # Optional (can install later if needed)
 # xformers>=0.0.20  # For efficient attention (requires CUDA)
 # peft>=0.4.0  # For LoRA adapters

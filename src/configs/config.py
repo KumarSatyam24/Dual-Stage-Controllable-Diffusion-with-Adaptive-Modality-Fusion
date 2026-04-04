@@ -110,7 +110,7 @@ class TrainingConfig:
     # Checkpointing
     save_every_n_epochs: int = 1  # Save every 2 epochs → epoch_2, epoch_4, epoch_6, epoch_8, final
     checkpoint_dir: str = "/workspace/checkpoints"
-    resume_from_checkpoint: Optional[str] = "/workspace/checkpoints/stage2/epoch_2.pt"
+    resume_from_checkpoint: Optional[str] = "/workspace/checkpoints/stage2/epoch_6.pt"
     resume_from_epoch: int = 0  # Set to N to resume training from epoch N
     stage1_checkpoint: str = "/workspace/checkpoints/stage1/epoch_18.pt"
 
@@ -156,7 +156,7 @@ class InferenceConfig:
     
     # Model checkpoint
     stage1_checkpoint: str = "/workspace/checkpoints/stage1/epoch_18.pt"
-    stage2_checkpoint: str = "/workspace/checkpoints/stage2/final.pt"
+    stage2_checkpoint: str = "/workspace/checkpoints/stage2/epoch_6.pt"
     
     # Generation
     num_inference_steps: int = 50  # Stage 1

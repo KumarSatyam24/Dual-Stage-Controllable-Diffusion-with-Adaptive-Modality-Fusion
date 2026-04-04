@@ -323,8 +323,10 @@ class Stage2SemanticRefinement(nn.Module):
             encoder_hidden_states=text_embeddings,
             return_dict=False
         )[0]
-        
-        
+
+        if not return_dict:
+            return noise_pred
+
         return {
             "noise_pred": noise_pred,
             "modulation_map": batch_modulation_map,

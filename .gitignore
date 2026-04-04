@@ -99,6 +99,7 @@ validation_results/
 validation_examples/
 wandb/
 logs/
+results/
 # Tensorboard
 tensorboard/
 events.out.tfevents*

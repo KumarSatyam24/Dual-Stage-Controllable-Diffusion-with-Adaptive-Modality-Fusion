@@ -115,7 +115,7 @@ class FixedClassValidationDataset(Dataset):
         rng.shuffle(shuffled)
 
         # Take first 100
-        selected = shuffled[:10]
+        selected = shuffled[:100]
         return sorted(selected)  # Sort for consistent ordering
 
     def _load_one_per_class(self):
@@ -138,7 +138,7 @@ class FixedClassValidationDataset(Dataset):
                 continue
 
             # Pick one deterministically
-            sketch_path = sketch_files[2]
+            sketch_path = sketch_files[0]
             sketch_stem = sketch_path.stem
 
             # Find corresponding photo
