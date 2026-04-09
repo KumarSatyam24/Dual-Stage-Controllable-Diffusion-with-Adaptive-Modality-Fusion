@@ -45,6 +45,7 @@ outputs/
 runs/
 logs/
 wandb/
+wandb_logs/
 
 # Model weights
 *.pth
