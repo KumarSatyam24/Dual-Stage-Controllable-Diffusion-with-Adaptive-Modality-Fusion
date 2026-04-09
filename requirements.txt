@@ -44,3 +44,6 @@ streamlit-drawable-canvas>=0.9.3
 # peft>=0.4.0  # For LoRA adapters
 # wandb>=0.15.0  # For experiment tracking
 # torch-geometric>=2.3.0  # For advanced graph features
+
+
+accelerate

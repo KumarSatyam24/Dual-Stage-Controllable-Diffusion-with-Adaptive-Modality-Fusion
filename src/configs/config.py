@@ -130,13 +130,15 @@ class TrainingConfig:
     delta_threshold_low: float = 0.35
     
     # Early stopping
-    early_stopping_patience: int = 5
+    early_stopping_patience: int = 2
     
     # Logging
     log_every_n_steps: int = 10
     use_wandb: bool = False  # Disabled by default (install wandb if needed)
     wandb_project: str = "ragaf-diffusion"
     wandb_run_name: Optional[str] = None
+    wandb_run_id: Optional[str] = None  # Set to resume existing wandb run
+    validate_on_resume: bool = False  # Run validation on resumed checkpoint before training
     
     # Validation
     validate_every_n_epochs: int = 2

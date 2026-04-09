@@ -116,7 +116,10 @@ class Stage2SemanticRefinement(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(hidden_dim * 2, hidden_dim)
         )
-        
+
+        # Text projection for fallback when graph has no nodes (always initialized)
+        self.text_proj = nn.Linear(text_dim, hidden_dim)
+
         print(f"Stage 2 Semantic Refinement initialized. Residual: {use_residual}, Concat: {concatenate_stage1}")
 
     def _adjust_unet_input_channels(self):
@@ -245,8 +248,6 @@ class Stage2SemanticRefinement(nn.Module):
                 # Handle empty graph: use global text features as fallback
                 text_feat = text_embeddings[i].mean(0) # (D,)
                 if text_feat.shape[-1] != self.hidden_dim:
-                    if not hasattr(self, 'text_proj'):
-                        self.text_proj = nn.Linear(text_feat.shape[-1], self.hidden_dim).to(device)
                     fused = self.text_proj(text_feat)
                 else:
                     fused = text_feat
@@ -363,7 +364,10 @@ class Stage2SemanticRefinement(nn.Module):
         
         # Refinement MLP
         trainable_params.extend(self.refinement_mlp.parameters())
-        
+
+        # Text projection
+        trainable_params.extend(self.text_proj.parameters())
+
         # UNet parameters (if not frozen)
         trainable_params.extend(
             p for p in self.unet.parameters() if p.requires_grad

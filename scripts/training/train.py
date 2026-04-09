@@ -99,15 +99,22 @@ class RAGAFDiffusionTrainer:
         if self.accelerator.is_main_process:
             if training_config.use_wandb:
                 import wandb
-                wandb.init(
-                    project=training_config.wandb_project,
-                    name=training_config.wandb_run_name,
-                    config={
+                wandb_kwargs = {
+                    "project": training_config.wandb_project,
+                    "name": training_config.wandb_run_name,
+                    "config": {
                         "model": vars(model_config),
                         "data": vars(data_config),
                         "training": vars(training_config)
                     }
-                )
+                }
+                # Support resuming existing wandb run
+                wandb_run_id = getattr(training_config, "wandb_run_id", None)
+                if wandb_run_id:
+                    wandb_kwargs["id"] = wandb_run_id
+                    wandb_kwargs["resume"] = "must"
+                    print(f"▶️ Resuming wandb run: {wandb_run_id}")
+                wandb.init(**wandb_kwargs)
         
         # Initialize models
         self.setup_models()
@@ -656,7 +663,6 @@ class RAGAFDiffusionTrainer:
         )
         
         # Compute Stage-2 metrics — CPU-heavy, gated to every 10 steps
-        self._s2_step_count = getattr(self, '_s2_step_count', 0) + 1
         if self._s2_step_count % 10 == 0 and pred_images is not None:
             s2_ssim, s2_psnr = self.compute_metrics(pred_images.detach(), photos)
             s1_ssim, s1_psnr = self.compute_metrics(s1_images.detach(), photos)
@@ -773,7 +779,7 @@ class RAGAFDiffusionTrainer:
                 noise = torch.randn_like(gt_latents)
                 t_val = torch.ones((bs,), device=device, dtype=torch.long) * 500
                 noisy_gt = self.noise_scheduler.add_noise(gt_latents, noise, t_val)
-                noise_pred = model_to_eval(noisy_gt, t_val, current_graphs, text_embeddings, stage1_latents=s1_latents)["noise_pred"]
+                noise_pred = model_to_eval(noisy_gt, t_val, current_graphs, text_embeddings, stage1_latents=s1_latents, return_dict=True)["noise_pred"]
                 
                 all_metrics["val_loss"].append(F.mse_loss(noise_pred, noise).item())
                 all_metrics["val_s2_ssim"].append(s2_ssim)
@@ -882,9 +888,24 @@ class RAGAFDiffusionTrainer:
     
             unwrapped = self.accelerator.unwrap_model(model)
             unwrapped.load_state_dict(ckpt["model_state_dict"])
-    
-            # ✅ Set correct start epoch
+
+            # ✅ Restore optimizer
+            if "optimizer_state_dict" in ckpt and ckpt["optimizer_state_dict"] is not None:
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                print("✅ Optimizer state restored")
+
+            # ✅ Restore scheduler
+            if "scheduler_state_dict" in ckpt and ckpt["scheduler_state_dict"] is not None:
+                lr_scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+                print("✅ Scheduler state restored")
+
+            # ✅ Restore step
+            global_step = ckpt.get("global_step", 0)
+            self.global_step = global_step
+
+            # ✅ Resume epoch
             start_epoch = ckpt.get("epoch", 0) + 1
+    
     
             print(f"✅ Loaded weights from epoch {ckpt['epoch'] + 1}")
             print(f"✅ Resuming training from epoch {start_epoch}")
@@ -892,13 +913,32 @@ class RAGAFDiffusionTrainer:
         else:
             print("⚠️ No checkpoint found. Training from scratch.")
 
-        global_step = start_epoch * len(train_dataloader)
-        
+        global_step = getattr(self, "global_step", start_epoch * len(train_dataloader))
+        self.global_step = global_step
+
+        # Validate on resume if requested (runs validation on the loaded checkpoint before training)
+        if getattr(self.training_config, "validate_on_resume", False) and resume_path is not None and stage == "stage2":
+            if self.accelerator.is_main_process:
+                print(f"\n[Epoch {start_epoch}] Running validation on resumed checkpoint...")
+            val_results = self.validate_stage2(model)
+            avg_metrics = val_results["avg_metrics"]
+            if self.accelerator.is_main_process:
+                print(f"✅ Resume Val SSIM: {avg_metrics['val_s2_ssim']:.4f}, Val Loss: {avg_metrics['val_loss']:.4f}")
+                if self.training_config.use_wandb:
+                    import wandb
+                    wandb.log({
+                        f"{stage}/val_ssim": avg_metrics["val_s2_ssim"],
+                        f"{stage}/val_loss": avg_metrics["val_loss"],
+                        f"{stage}/val_s1_ssim": avg_metrics["val_s1_ssim"],
+                        f"{stage}/val_psnr": avg_metrics["val_s2_psnr"],
+                        "epoch": start_epoch
+                    }, step=global_step)
+
         # Best model tracking and early stopping
         best_ssim = -1.0
         patience_counter = 0
         patience = getattr(self.training_config, "early_stopping_patience", 5)
-        
+
         # Diagnostics history
         comparison_history = []
         
@@ -966,7 +1006,9 @@ class RAGAFDiffusionTrainer:
                     
                     # Optimizer step
                     optimizer.step()
-                    if self.accelerator.sync_gradients:
+                    #if self.accelerator.sync_gradients:
+                    #    lr_scheduler.step()
+                    if self.accelerator.sync_gradients and self.training_config.learning_rate > 5e-6:
                         lr_scheduler.step()
                     optimizer.zero_grad()
                 
@@ -977,7 +1019,7 @@ class RAGAFDiffusionTrainer:
                     epoch_delta_means.append(outputs["metrics"]["delta_mean"])
                 
                 global_step += 1
-                
+                self.global_step = global_step
                 # Adaptive scaling automatic logic (Stage 2)
                 if stage == "stage2" and "metrics" in outputs and self.accelerator.is_main_process:
                     d_mean = outputs["metrics"]["delta_mean"]
@@ -1020,7 +1062,7 @@ class RAGAFDiffusionTrainer:
                 # Minimal Logging
                 if global_step % self.training_config.log_every_n_steps == 0:
                     avg_loss = epoch_loss / (step + 1)
-                    lr = lr_scheduler.get_last_lr()[0]
+                    lr = optimizer.param_groups[0]["lr"]
                     logs = {
                         f"{stage}/loss": avg_loss,
                         f"{stage}/lr": lr,
@@ -1035,7 +1077,7 @@ class RAGAFDiffusionTrainer:
 
             # 1. Save periodic checkpoint FIRST (as requested)
             if (epoch + 1) % self.training_config.save_every_n_epochs == 0:
-                self.save_checkpoint(stage, model, epoch)
+                self.save_checkpoint(stage, model, epoch, optimizer, lr_scheduler)
 
             # 2. End of Epoch Evaluation and Diagnostics
             if stage == "stage2":
@@ -1095,7 +1137,7 @@ class RAGAFDiffusionTrainer:
                 best_ssim = eval_metric
                 patience_counter = 0
                 print(f"🌟 New best evaluation score! Saving best_{stage}.pt")
-                self.save_checkpoint(stage, model, epoch, filename=f"best_{stage}.pt")
+                self.save_checkpoint(stage, model, epoch, optimizer, lr_scheduler, filename=f"best_{stage}.pt")
             else:
                 patience_counter += 1
 
@@ -1106,7 +1148,7 @@ class RAGAFDiffusionTrainer:
                 break
         
         # Save final checkpoint
-        self.save_checkpoint(stage, model, num_epochs, final=True)
+        self.save_checkpoint(stage, model, num_epochs, optimizer, lr_scheduler, final=True)
 
     def save_visual_grid(self, images_dict, stage, step):
         """Save a grid of images for visual validation."""
@@ -1134,7 +1176,7 @@ class RAGAFDiffusionTrainer:
                 return str(path)
         return None
 
-    def save_checkpoint(self, stage: str, model, epoch: int, final: bool = False, filename: Optional[str] = None):
+    def save_checkpoint(self, stage: str, model, epoch: int,optimizer=None, lr_scheduler=None, final: bool = False, filename: Optional[str] = None):
         """
         Save model checkpoint locally, upload to HuggingFace Hub, then aggressively cleanup old checkpoints.
         """
@@ -1161,6 +1203,9 @@ class RAGAFDiffusionTrainer:
         checkpoint_data = {
             "epoch": epoch,
             "model_state_dict": unwrapped_model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
+            "scheduler_state_dict": lr_scheduler.state_dict() if lr_scheduler is not None else None,
+            "global_step": getattr(self, "global_step", 0),
             "config": {
                 "model": vars(self.model_config),
                 "data": vars(self.data_config),
@@ -1284,7 +1329,9 @@ def main():
     parser.add_argument("--stage2_checkpoint",type=int,default=None,help="Path to Stage 2 checkpoint to resume from")
     
     parser.add_argument("--resume_checkpoint",type=str,default=None,help="Path to checkpoint to resume from")
-    
+    parser.add_argument("--wandb_run_id",type=str,default=None,help="WandB run ID to resume (e.g., 38yynez0)")
+    parser.add_argument("--validate_on_resume",action="store_true",help="Run validation on resumed checkpoint before training")
+
     args = parser.parse_args()
     
     # Load config
@@ -1318,7 +1365,13 @@ def main():
         print(f"▶️  Will resume Stage 1 from epoch {args.resume_epoch}")
     if args.resume_checkpoint is not None:
         config["training"].resume_from_checkpoint = args.resume_checkpoint
-    
+    if args.wandb_run_id is not None:
+        config["training"].wandb_run_id = args.wandb_run_id
+        print(f"▶️  Will resume wandb run: {args.wandb_run_id}")
+    if args.validate_on_resume:
+        config["training"].validate_on_resume = True
+        print(f"▶️  Will validate on resume before starting training")
+
     # Check for WandB availability
     try:
         import wandb

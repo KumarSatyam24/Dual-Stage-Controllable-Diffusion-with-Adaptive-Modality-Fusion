@@ -1,0 +1,168 @@
+wandb_version: 1
+
+_wandb:
+  desc: null
+  value:
+    python_version: 3.12.13
+    cli_version: 0.25.1
+    framework: huggingface
+    huggingface_version: 5.3.0
+    is_jupyter_run: false
+    is_kaggle_kernel: false
+    start_time: 1774592983
+    t:
+      1:
+      - 1
+      - 11
+      - 41
+      - 49
+      - 71
+      - 83
+      2:
+      - 1
+      - 11
+      - 41
+      - 49
+      - 71
+      - 83
+      3:
+      - 16
+      - 37
+      - 42
+      4: 3.12.13
+      5: 0.25.1
+      6: 5.3.0
+      13: linux-x86_64
+    e:
+      xz8b5n7h8kyog375z0y6lviscm9rd0bi:
+        os: Linux-5.15.0-161-generic-x86_64-with-glibc2.39
+        python: CPython 3.12.13
+        started_at: '2026-03-27T06:29:42.889955Z'
+        args:
+        - --stage
+        - stage2
+        - --batch_size
+        - '2'
+        - --grad_accum
+        - '8'
+        - --learning_rate
+        - 3e-5
+        - --epochs
+        - '2'
+        - --checkpoint_dir
+        - /workspace/checkpoints
+        - --save_every
+        - '1'
+        - --dataset_limit
+        - '10000'
+        - --resume_checkpoint
+        - /workspace/checkpoints/stage2/epoch_1.pt
+        program: /root/Dual-Stage-Controllable-Diffusion-with-Adaptive-Modality-Fusion/scripts/training/train.py
+        code_path: scripts/training/train.py
+        code_path_local: scripts/training/train.py
+        git:
+          remote_url: git@github.com:KumarSatyam24/Dual-Stage-Controllable-Diffusion-with-Adaptive-Modality-Fusion.git
+          commit: 5514a55596bdbcd3623277f183d52965bbea196b
+        email: satyam.kumar2022@vitstudent.ac.in
+        root: /root/Dual-Stage-Controllable-Diffusion-with-Adaptive-Modality-Fusion
+        host: a1d66315f570
+        executable: /venv/main/bin/python
+        cpu_count: 68
+        cpu_count_logical: 272
+        gpu_type: NVIDIA GeForce RTX 5090
+        gpu_count: 1
+        disk:
+          /:
+            total: '134217728000'
+            used: '34724466688'
+        memory:
+          total: '270069604352'
+        gpu_nvidia:
+        - name: NVIDIA GeForce RTX 5090
+          memory_total: '34190917632'
+          cuda_cores: 21760
+          architecture: Blackwell
+          uuid: GPU-0adba8c2-c2cc-e503-0894-8d50ff652086
+        cuda_version: '13.0'
+        writer_id: xz8b5n7h8kyog375z0y6lviscm9rd0bi
+model:
+  desc: null
+  value:
+    pretrained_model_name: runwayml/stable-diffusion-v1-5
+    sketch_encoder_channels:
+    - 320
+    - 640
+    - 1280
+    - 1280
+    freeze_stage1_unet: true
+    node_feature_dim: 6
+    text_dim: 768
+    hidden_dim: 512
+    num_graph_layers: 2
+    num_attention_heads: 8
+    ragaf_dropout: 0.1
+    fusion_method: learned
+    use_region_adaptive_fusion: true
+    use_lora: true
+    lora_rank: 4
+    lora_alpha: 4
+    residual_alpha: 0.2
+data:
+  desc: null
+  value:
+    dataset_name: sketchy
+    sketchy_root: /workspace/sketchy
+    coco_root: /workspace/coco
+    image_size: 256
+    sketch_method: canny
+    min_region_area: 100
+    max_num_regions: 50
+    graph_type: adjacency
+    batch_size: 2
+    num_workers: 8
+    pin_memory: true
+    use_augmentation: true
+    cache_sketches: true
+    preload_graphs: true
+training:
+  desc: null
+  value:
+    train_stage: stage2
+    stage1_epochs: 2
+    stage2_epochs: 2
+    learning_rate: 3.0e-05
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-08
+    adam_weight_decay: 0.01
+    lr_scheduler: cosine
+    lr_warmup_steps: 500
+    max_grad_norm: 1.0
+    gradient_accumulation_steps: 8
+    mixed_precision: bf16
+    num_train_timesteps: 1000
+    noise_scheduler: ddpm
+    save_every_n_epochs: 1
+    checkpoint_dir: /workspace/checkpoints
+    resume_from_checkpoint: /workspace/checkpoints/stage2/epoch_1.pt
+    resume_from_epoch: 0
+    stage1_checkpoint: /workspace/checkpoints/stage1/epoch_18.pt
+    push_to_hub: true
+    hub_repo_id: DrRORAL/ragaf-diffusion-checkpoints
+    hub_token: null
+    lambda_identity: 0.5
+    lambda_lpips: 0.1
+    lambda_delta: 0.05
+    delta_threshold_high: 0.75
+    delta_threshold_low: 0.35
+    early_stopping_patience: 5
+    log_every_n_steps: 10
+    use_wandb: true
+    wandb_project: ragaf-diffusion
+    wandb_run_name: null
+    validate_every_n_epochs: 2
+    num_validation_samples: 16
+    device: cuda
+    use_runpod: false
+    runpod_volume_path: /workspace
+    dataset_limit: 10000
