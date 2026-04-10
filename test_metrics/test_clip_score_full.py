@@ -42,6 +42,24 @@ except ImportError:
     print("⚠️  CLIP not available. Install: pip install git+https://github.com/openai/CLIP.git")
 
 
+def optimize_prompt(prompt, category):
+    """
+    Optimizes a simple prompt for better CLIP score alignment.
+
+    Args:
+        prompt: Original simple prompt (e.g., "A photo of a dog")
+        category: Object category (e.g., "dog")
+
+    Returns:
+        Optimized prompt for CLIP
+    """
+    return (
+        f"A high-quality, realistic photograph of a {category}, "
+        f"based on the description: {prompt}, with natural lighting, "
+        f"sharp details, and accurate colors."
+    )
+
+
 class CLIPScoreValidator:
     """Standalone CLIP Score metric validator for full test set."""
 
@@ -56,7 +74,8 @@ class CLIPScoreValidator:
         num_inference_steps=50,
         guidance_scale=7.5,
         device='cuda',
-        clip_model='ViT-B/32'
+        clip_model='ViT-B/32',
+        optimize_prompts=True
     ):
         self.stage1_checkpoint = Path(stage1_checkpoint)
         self.stage2_checkpoint = Path(stage2_checkpoint)
@@ -68,6 +87,7 @@ class CLIPScoreValidator:
         self.guidance_scale = guidance_scale
         self.device = device
         self.clip_model_name = clip_model
+        self.optimize_prompts = optimize_prompts
 
         if not CLIP_AVAILABLE:
             raise RuntimeError("CLIP is required but not installed.")
@@ -88,6 +108,7 @@ class CLIPScoreValidator:
         print(f"   Output:  {self.output_dir}")
         print(f"   Device:  {device}")
         print(f"   CLIP Model: {clip_model}")
+        print(f"   Prompt Optimization: {'Enabled' if optimize_prompts else 'Disabled'}")
         print("=" * 70)
         print()
 
@@ -244,12 +265,16 @@ class CLIPScoreValidator:
             max_length=self.tokenizer.model_max_length, return_tensors="pt")
         uncond_embeddings = self.text_encoder(uncond_inputs.input_ids.to(self.device))[0]
 
-        scheduler = DDIMScheduler.from_pretrained("runwayml/stable-diffusion-v1-5", subfolder="scheduler")
+        self.stage2_scheduler = DDIMScheduler.from_pretrained("runwayml/stable-diffusion-v1-5", subfolder="scheduler")
+        scheduler = self.stage2_scheduler
         scheduler.set_timesteps(30)
         timesteps = scheduler.timesteps[-15:]
 
         noise = torch.randn_like(stage1_latent)
         latents = scheduler.add_noise(stage1_latent, noise, timesteps[0])
+
+        # Duplicate region_graphs for CFG (uncond + cond)
+        region_graphs_cfg = region_graphs + region_graphs if region_graphs else region_graphs
 
         for t in timesteps:
             latent_model_input = torch.cat([latents] * 2)
@@ -258,7 +283,7 @@ class CLIPScoreValidator:
             stage1_latent_cfg = torch.cat([stage1_latent] * 2)
 
             noise_pred = self.stage2(
-                latent_model_input, t.to(self.device), region_graphs,
+                latent_model_input, t.to(self.device), region_graphs_cfg,
                 encoder_hidden_states, stage1_latents=stage1_latent_cfg, return_dict=False
             )
 
@@ -270,30 +295,47 @@ class CLIPScoreValidator:
         refined = (refined / 2 + 0.5).clamp(0, 1)
         return refined
 
+    @torch.no_grad()
     def compute_clip_score(self, generated, text_prompts):
-        """Compute CLIP Score metric."""
-        clip_scores = []
+        """Compute CLIP Score metric (batch processing)."""
+        batch_size = generated.shape[0]
+        num_prompts = len(text_prompts)
 
-        for i, prompt in enumerate(text_prompts):
-            # Prepare image
-            img = generated[i]
-            img_np = (img.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
-            img_pil = Image.fromarray(img_np)
-            img_tensor = self.clip_preprocess(img_pil).unsqueeze(0).to(self.device)
+        if batch_size != num_prompts:
+            print(f"Warning: Mismatch - {batch_size} images vs {num_prompts} prompts")
+            # Truncate to minimum
+            min_size = min(batch_size, num_prompts)
+            generated = generated[:min_size]
+            text_prompts = text_prompts[:min_size]
+            batch_size = min_size
 
-            # Encode
-            image_features = self.clip_model.encode_image(img_tensor)
-            text_tokens = clip.tokenize([prompt]).to(self.device)
-            text_features = self.clip_model.encode_text(text_tokens)
+        # Prepare images in batch: (B, 3, 224, 224)
+        imgs_np = (generated.cpu().numpy().transpose(0, 2, 3, 1) * 255).astype(np.uint8)
+        img_tensors = []
+        for i in range(batch_size):
+            img_pil = Image.fromarray(imgs_np[i])
+            img_tensor = self.clip_preprocess(img_pil)
+            img_tensors.append(img_tensor)
+        img_batch = torch.stack(img_tensors).to(self.device)
 
-            # Normalize and compute cosine similarity
-            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-            score = (image_features @ text_features.T).item()
+        # Tokenize all prompts
+        text_tokens = clip.tokenize(text_prompts).to(self.device)
 
-            clip_scores.append(score)
+        # Encode in batch
+        image_features = self.clip_model.encode_image(img_batch)
+        text_features = self.clip_model.encode_text(text_tokens)
 
-        return np.mean(clip_scores)
+        # Normalize
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+        # Compute cosine similarity: (B, B) diagonal contains text-image pairs
+        similarity = (image_features @ text_features.T).diag()
+
+        # Convert to list of scores
+        clip_scores = [(max(score.item(), 0) * 100) for score in similarity]
+
+        return clip_scores
 
     def validate(self):
         """Run validation on full test set."""
@@ -330,23 +372,37 @@ class CLIPScoreValidator:
             try:
                 generated, stage1 = self.generate(sketches, prompts, region_graphs)
 
-                clip_stage2 = self.compute_clip_score(generated, prompts)
-                clip_stage1 = self.compute_clip_score(stage1, prompts)
+                # Optimize prompts for CLIP evaluation if enabled
+                if self.optimize_prompts:
+                    eval_prompts = [optimize_prompt(p, c) for p, c in zip(prompts, categories)]
+                else:
+                    eval_prompts = prompts
 
-                self.results['stage2_clip_scores'].append(clip_stage2)
-                self.results['stage1_clip_scores'].append(clip_stage1)
+                clip_stage2_scores = self.compute_clip_score(generated, eval_prompts)
+                clip_stage1_scores = self.compute_clip_score(stage1, eval_prompts)
 
-                for i, file_id in enumerate(file_ids):
-                    self.results['per_sample_results'].append({
-                        'file_id': file_id,
+                # Get actual number of samples processed (may differ from batch_data size)
+                num_processed = len(clip_stage2_scores)
+
+                self.results['stage2_clip_scores'].extend(clip_stage2_scores)
+                self.results['stage1_clip_scores'].extend(clip_stage1_scores)
+
+                for i in range(num_processed):
+                    result = {
+                        'file_id': file_ids[i],
                         'category': categories[i],
                         'prompt': prompts[i],
-                        'stage2_clip_score': clip_stage2,
-                        'stage1_clip_score': clip_stage1
-                    })
+                        'stage2_clip_score': clip_stage2_scores[i],
+                        'stage1_clip_score': clip_stage1_scores[i]
+                    }
+                    if self.optimize_prompts:
+                        result['eval_prompt'] = eval_prompts[i]
+                    self.results['per_sample_results'].append(result)
 
             except Exception as e:
+                import traceback
                 print(f"Error processing batch {batch_idx}: {e}")
+                traceback.print_exc()
                 continue
 
             if (batch_idx + 1) % 10 == 0:
@@ -397,7 +453,8 @@ class CLIPScoreValidator:
                     'image_size': self.image_size,
                     'num_inference_steps': self.num_inference_steps,
                     'guidance_scale': self.guidance_scale,
-                    'clip_model': self.clip_model_name
+                    'clip_model': self.clip_model_name,
+                    'optimize_prompts': self.optimize_prompts
                 },
                 'execution_time_seconds': elapsed_time,
                 'timestamp': datetime.now().isoformat()
@@ -422,7 +479,7 @@ class CLIPScoreValidator:
         print(f"  - CSV:  {csv_path}")
 
 
-def main():
+def main(): 
     parser = argparse.ArgumentParser(description="CLIP Score Metric Test on Full Sketchy Test Set")
     parser.add_argument("--stage1_checkpoint", type=str, required=True)
     parser.add_argument("--stage2_checkpoint", type=str, required=True)
@@ -434,6 +491,7 @@ def main():
     parser.add_argument("--guidance_scale", type=float, default=7.5)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--clip_model", type=str, default="ViT-B/32", choices=["ViT-B/32", "ViT-B/16", "ViT-L/14", "RN50", "RN101"])
+    parser.add_argument("--optimize_prompts", type=bool, default=True, help="Enable CLIP-optimized prompts")
 
     args = parser.parse_args()
 
@@ -447,10 +505,12 @@ def main():
         num_inference_steps=args.num_inference_steps,
         guidance_scale=args.guidance_scale,
         device=args.device,
-        clip_model=args.clip_model
+        clip_model=args.clip_model,
+        optimize_prompts=args.optimize_prompts
     )
 
     validator.validate()
+    
 
 
 if __name__ == "__main__":

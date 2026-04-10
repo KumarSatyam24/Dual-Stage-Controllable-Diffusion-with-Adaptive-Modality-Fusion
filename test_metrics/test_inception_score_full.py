@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
-DISTS Metric Test on Full Sketchy Test Set
+Inception Score (IS) Metric Test on Full Sketchy Test Set
 
-Computes Deep Image Structure and Texture Similarity.
-DISTS is a perceptual metric that better aligns with human perception than LPIPS
-by separating structure and texture information.
-Lower values indicate more similar images.
+Computes Inception Score for generated images using Inception V3.
+IS measures both the quality (confidence of predictions) and diversity
+of generated images. Higher IS indicates better quality and diversity.
+
+Typical range: 1.0 to 10.0+, higher is better
 
 Usage:
-    python test_metrics/test_dists_full.py \
+    python test_metrics/test_inception_score_full.py \
         --stage1_checkpoint /workspace/checkpoints/stage1/epoch_18.pt \
         --stage2_checkpoint /workspace/checkpoints/stage2/epoch_6.pt \
-        --output_dir ./results/dists_test \
-        --num_samples -1
+        --output_dir ./results/is_test \
+        --num_samples 100 \
+        --splits 10
 """
 
 import sys
@@ -22,6 +24,8 @@ sys.path.insert(0, str(project_root))
 sys.path.insert(0, str(project_root / 'src'))
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 import argparse
@@ -35,28 +39,35 @@ warnings.filterwarnings('ignore')
 from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
 from transformers import CLIPTextModel, CLIPTokenizer
 
-try:
-    from DISTS_pytorch import DISTS
-    DISTS_AVAILABLE = True
-except ImportError:
-    DISTS_AVAILABLE = False
-    print("⚠️  DISTS-pytorch not available. Install: pip install DISTS-pytorch")
+
+def get_inception_model(device='cuda'):
+    """Load Inception V3 model for feature extraction."""
+    try:
+        from torchvision.models import inception_v3, Inception_V3_Weights
+        model = inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1, transform_input=False)
+        model.eval()
+        model = model.to(device)
+        return model
+    except Exception as e:
+        print(f"⚠️  Could not load Inception V3: {e}")
+        return None
 
 
-class DISTSValidator:
-    """Standalone DISTS metric validator for full test set."""
+class InceptionScoreValidator:
+    """Standalone Inception Score metric validator for full test set."""
 
     def __init__(
         self,
         stage1_checkpoint,
         stage2_checkpoint,
-        output_dir="./results/dists_test",
+        output_dir="./results/is_test",
         batch_size=4,
         num_samples=-1,
         image_size=256,
         num_inference_steps=50,
-        guidance_scale=5.0,
-        device='cuda'
+        guidance_scale=7.5,
+        device='cuda',
+        splits=10
     ):
         self.stage1_checkpoint = Path(stage1_checkpoint)
         self.stage2_checkpoint = Path(stage2_checkpoint)
@@ -67,63 +78,61 @@ class DISTSValidator:
         self.num_inference_steps = num_inference_steps
         self.guidance_scale = guidance_scale
         self.device = device
-
-        if not DISTS_AVAILABLE:
-            raise RuntimeError("DISTS-pytorch is required but not installed. Run: pip install DISTS-pytorch")
+        self.splits = splits
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Initialize results storage
         self.results = {
-            'stage2_dists_scores': [],
-            'stage1_dists_scores': [],
+            'stage2_is_scores': [],
+            'stage2_is_stds': [],
+            'stage1_is_scores': [],
+            'stage1_is_stds': [],
             'per_sample_results': []
         }
 
         print("=" * 70)
-        print("📊 DISTS Metric Validation - Full Sketchy Test Set")
+        print("📊 Inception Score (IS) Metric Validation - Full Sketchy Test Set")
         print("=" * 70)
         print(f"   Stage 1: {self.stage1_checkpoint}")
         print(f"   Stage 2: {self.stage2_checkpoint}")
         print(f"   Output:  {self.output_dir}")
         print(f"   Device:  {device}")
+        print(f"   Splits:  {self.splits}")
         print("=" * 70)
         print()
 
         self.load_models()
         self.load_dataset()
-        self.setup_dists()
-
-    def setup_dists(self):
-        """Initialize DISTS model."""
-        print("📊 Setting up DISTS...")
-        self.dists_model = DISTS().to(self.device)
-        self.dists_model.eval()
-        print("   ✅ DISTS ready")
-        print()
 
     def load_models(self):
         """Load Stage 1 and Stage 2 models."""
         print("📦 Loading models...")
         model_name = "runwayml/stable-diffusion-v1-5"
 
+        # VAE
         self.vae = AutoencoderKL.from_pretrained(
             model_name, subfolder="vae"
         ).to(self.device).eval()
         print("   ✅ VAE loaded")
 
+        # Text encoder
         self.text_encoder = CLIPTextModel.from_pretrained(
             model_name, subfolder="text_encoder"
         ).to(self.device).eval()
         print("   ✅ Text Encoder loaded")
 
+        # Tokenizer
         self.tokenizer = CLIPTokenizer.from_pretrained(
             model_name, subfolder="tokenizer"
         )
 
+        # Scheduler
         self.scheduler = DDIMScheduler.from_pretrained(
             model_name, subfolder="scheduler"
         )
 
+        # Stage 1
         print("\n   Loading Stage 1...")
         from src.models.stage1_diffusion import Stage1SketchGuidedDiffusion
 
@@ -139,6 +148,7 @@ class DISTSValidator:
         self.stage1.load_state_dict(ckpt1["model_state_dict"], strict=False)
         print(f"   ✅ Stage 1 loaded")
 
+        # Stage 2
         print("\n   Loading Stage 2...")
         from src.models.stage2_refinement import Stage2SemanticRefinement
 
@@ -151,6 +161,14 @@ class DISTSValidator:
         ckpt2 = torch.load(self.stage2_checkpoint, map_location="cpu", weights_only=False)
         self.stage2.load_state_dict(ckpt2["model_state_dict"], strict=False)
         print(f"   ✅ Stage 2 loaded")
+
+        # Inception model
+        print("\n   Loading Inception V3...")
+        self.inception = get_inception_model(self.device)
+        if self.inception is not None:
+            print("   ✅ Inception V3 loaded")
+        else:
+            raise RuntimeError("Failed to load Inception V3 model")
         print()
 
     def load_dataset(self):
@@ -181,8 +199,13 @@ class DISTSValidator:
             text_prompt = [text_prompt]
 
         sketch = sketch.to(self.device)
+
+        # Stage 1: Sketch-guided generation
         stage1_output = self._run_stage1(sketch, text_prompt)
+
+        # Stage 2: Semantic refinement
         stage2_output = self._run_stage2(stage1_output, sketch, text_prompt, region_graphs)
+
         return stage2_output, stage1_output
 
     def _run_stage1(self, sketch, text_prompt):
@@ -190,20 +213,35 @@ class DISTSValidator:
         B = sketch.shape[0]
 
         text_inputs = self.tokenizer(
-            text_prompt, padding="max_length", max_length=self.tokenizer.model_max_length,
-            truncation=True, return_tensors="pt"
+            text_prompt,
+            padding="max_length",
+            max_length=self.tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt"
         )
-        text_embeddings = self.text_encoder(text_inputs.input_ids.to(self.device))[0]
+        text_embeddings = self.text_encoder(
+            text_inputs.input_ids.to(self.device)
+        )[0]
 
-        uncond_inputs = self.tokenizer([""] * B, padding="max_length",
-            max_length=self.tokenizer.model_max_length, return_tensors="pt")
-        uncond_embeddings = self.text_encoder(uncond_inputs.input_ids.to(self.device))[0]
+        uncond_inputs = self.tokenizer(
+            [""] * B,
+            padding="max_length",
+            max_length=self.tokenizer.model_max_length,
+            return_tensors="pt"
+        )
+        uncond_embeddings = self.text_encoder(
+            uncond_inputs.input_ids.to(self.device)
+        )[0]
 
         down_res, mid_res = self.stage1.encode_sketch(sketch)
         down_res_cfg = [torch.cat([r, r]) for r in down_res]
         mid_res_cfg = torch.cat([mid_res, mid_res])
 
-        latents = torch.randn(B, 4, self.image_size // 8, self.image_size // 8, device=self.device)
+        latents = torch.randn(
+            B, 4, self.image_size // 8, self.image_size // 8,
+            device=self.device
+        )
+
         self.scheduler.set_timesteps(self.num_inference_steps)
         latents = latents * self.scheduler.init_noise_sigma
 
@@ -213,8 +251,11 @@ class DISTSValidator:
             encoder_hidden_states = torch.cat([uncond_embeddings, text_embeddings])
 
             noise_pred = self.stage1.unet(
-                latent_model_input, t, encoder_hidden_states=encoder_hidden_states,
-                down_block_additional_residuals=down_res_cfg, mid_block_additional_residual=mid_res_cfg
+                latent_model_input,
+                t,
+                encoder_hidden_states=encoder_hidden_states,
+                down_block_additional_residuals=down_res_cfg,
+                mid_block_additional_residual=mid_res_cfg,
             ).sample
 
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
@@ -224,6 +265,7 @@ class DISTSValidator:
         latents = 1 / 0.18215 * latents
         image = self.vae.decode(latents).sample
         image = (image / 2 + 0.5).clamp(0, 1)
+
         return image
 
     def _run_stage2(self, stage1_output, sketch, text_prompt, region_graphs):
@@ -232,25 +274,35 @@ class DISTSValidator:
             text_prompt = [text_prompt]
 
         B = len(text_prompt)
-        stage1_latent = self.vae.encode(stage1_output * 2 - 1).latent_dist.sample() * 0.18215
 
-        text_inputs = self.tokenizer(text_prompt, padding="max_length",
-            max_length=self.tokenizer.model_max_length, truncation=True, return_tensors="pt")
+        stage1_latent = self.vae.encode(stage1_output * 2 - 1).latent_dist.sample()
+        stage1_latent = stage1_latent * 0.18215
+
+        text_inputs = self.tokenizer(
+            text_prompt,
+            padding="max_length",
+            max_length=self.tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt"
+        )
         text_embeddings = self.text_encoder(text_inputs.input_ids.to(self.device))[0]
 
-        uncond_inputs = self.tokenizer([""] * B, padding="max_length",
-            max_length=self.tokenizer.model_max_length, return_tensors="pt")
+        uncond_inputs = self.tokenizer(
+            [""] * B,
+            padding="max_length",
+            max_length=self.tokenizer.model_max_length,
+            return_tensors="pt"
+        )
         uncond_embeddings = self.text_encoder(uncond_inputs.input_ids.to(self.device))[0]
 
-        scheduler = DDIMScheduler.from_pretrained("runwayml/stable-diffusion-v1-5", subfolder="scheduler")
+        scheduler = DDIMScheduler.from_pretrained(
+            "runwayml/stable-diffusion-v1-5", subfolder="scheduler"
+        )
         scheduler.set_timesteps(30)
         timesteps = scheduler.timesteps[-15:]
 
         noise = torch.randn_like(stage1_latent)
         latents = scheduler.add_noise(stage1_latent, noise, timesteps[0])
-
-        # Duplicate region_graphs for CFG (uncond + cond)
-        region_graphs_cfg = region_graphs + region_graphs if region_graphs else region_graphs
 
         for t in timesteps:
             latent_model_input = torch.cat([latents] * 2)
@@ -259,8 +311,12 @@ class DISTSValidator:
             stage1_latent_cfg = torch.cat([stage1_latent] * 2)
 
             noise_pred = self.stage2(
-                latent_model_input, t.to(self.device), region_graphs_cfg,
-                encoder_hidden_states, stage1_latents=stage1_latent_cfg, return_dict=False
+                latent_model_input,
+                t.to(self.device),
+                region_graphs,
+                encoder_hidden_states,
+                stage1_latents=stage1_latent_cfg,
+                return_dict=False
             )
 
             noise_uncond, noise_text = noise_pred.chunk(2)
@@ -269,36 +325,84 @@ class DISTSValidator:
 
         refined = self.vae.decode(latents / 0.18215).sample
         refined = (refined / 2 + 0.5).clamp(0, 1)
+
         return refined
 
-    def compute_dists(self, generated, ground_truth):
-        """Compute DISTS metric."""
-        # DISTS expects images in [0, 1]
-        dists_score = self.dists_model(
-            generated.to(self.device),
-            ground_truth.to(self.device),
-            require_grad=False
-        ).mean().item()
-        return dists_score
+    def compute_inception_score(self, images, splits=10):
+        """
+        Compute Inception Score for generated images.
+
+        IS = exp(E_x[KL(p(y|x) || p(y))])
+
+        Args:
+            images: Tensor of shape (N, 3, H, W) in range [0, 1]
+            splits: Number of splits for computing mean and std
+
+        Returns:
+            mean: Mean IS across splits
+            std: Standard deviation of IS across splits
+        """
+        N = images.shape[0]
+
+        # Resize and normalize for Inception
+        # Inception expects 299x299 images
+        images_resized = F.interpolate(images, size=(299, 299), mode='bilinear', align_corners=False)
+
+        # Normalize with ImageNet stats
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(images.device)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(images.device)
+        images_normalized = (images_resized - mean) / std
+
+        # Get predictions
+        preds = []
+        batch_size = 32
+        with torch.no_grad():
+            for i in range(0, N, batch_size):
+                batch = images_normalized[i:i+batch_size]
+                pred = self.inception(batch)
+                pred = F.softmax(pred, dim=1)
+                preds.append(pred.cpu().numpy())
+
+        preds = np.concatenate(preds, axis=0)
+
+        # Compute IS
+        split_scores = []
+        for k in range(splits):
+            part = preds[k * (N // splits): (k + 1) * (N // splits), :]
+            py = np.mean(part, axis=0)  # marginal distribution p(y)
+            scores = []
+            for i in range(part.shape[0]):
+                pyx = part[i, :]  # conditional distribution p(y|x)
+                scores.append(entropy(pyx, py))
+            split_scores.append(np.exp(np.mean(scores)))
+
+        return np.mean(split_scores), np.std(split_scores)
 
     def validate(self):
         """Run validation on full test set."""
-        print("🔄 Starting DISTS validation...")
+        print("🔄 Starting Inception Score validation...")
         print(f"   Total samples: {self.num_samples}")
         print(f"   Batch size: {self.batch_size}")
+        print(f"   Splits: {self.splits}")
         print()
 
         start_time = time.time()
         num_batches = (self.num_samples + self.batch_size - 1) // self.batch_size
 
-        for batch_idx in tqdm(range(num_batches), desc="Computing DISTS"):
+        # Collect all generated images for IS computation
+        stage2_images = []
+        stage1_images = []
+        all_metadata = []
+
+        for batch_idx in tqdm(range(num_batches), desc="Generating images"):
             start_idx = batch_idx * self.batch_size
             end_idx = min(start_idx + self.batch_size, self.num_samples)
 
             batch_data = []
             for i in range(start_idx, end_idx):
                 try:
-                    batch_data.append(self.dataset[i])
+                    sample = self.dataset[i]
+                    batch_data.append(sample)
                 except Exception as e:
                     print(f"Error loading sample {i}: {e}")
                     continue
@@ -307,74 +411,82 @@ class DISTSValidator:
                 continue
 
             sketches = torch.stack([d['sketch'] for d in batch_data])
-            photos_gt = torch.stack([d['photo'] for d in batch_data])
             prompts = [d['text_prompt'] for d in batch_data]
             file_ids = [d['file_id'] for d in batch_data]
             categories = [d['category'] for d in batch_data]
             region_graphs = [d['region_graph'] for d in batch_data]
 
-            photos_gt = (photos_gt + 1) / 2
-
             try:
                 generated, stage1 = self.generate(sketches, prompts, region_graphs)
 
-                dists_stage2 = self.compute_dists(generated, photos_gt)
-                dists_stage1 = self.compute_dists(stage1, photos_gt)
-
-                self.results['stage2_dists_scores'].append(dists_stage2)
-                self.results['stage1_dists_scores'].append(dists_stage1)
+                stage2_images.append(generated.cpu())
+                stage1_images.append(stage1.cpu())
 
                 for i, file_id in enumerate(file_ids):
-                    self.results['per_sample_results'].append({
+                    all_metadata.append({
                         'file_id': file_id,
                         'category': categories[i],
-                        'prompt': prompts[i],
-                        'stage2_dists': dists_stage2,
-                        'stage1_dists': dists_stage1
+                        'prompt': prompts[i]
                     })
 
             except Exception as e:
                 print(f"Error processing batch {batch_idx}: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
 
+            # Save intermediate results every 10 batches
             if (batch_idx + 1) % 10 == 0:
-                self.save_intermediate_results()
+                print(f"\n   Processed {(batch_idx + 1) * self.batch_size} samples...")
+
+        print("\n📊 Computing Inception Score...")
+
+        # Compute IS for Stage 2
+        if len(stage2_images) > 0:
+            stage2_tensor = torch.cat(stage2_images, dim=0)
+            print(f"   Computing IS for {stage2_tensor.shape[0]} Stage 2 images...")
+            is_mean_s2, is_std_s2 = self.compute_inception_score(stage2_tensor, splits=self.splits)
+            self.results['stage2_is_scores'] = [is_mean_s2]
+            self.results['stage2_is_stds'] = [is_std_s2]
+            print(f"   Stage 2 IS: {is_mean_s2:.2f} ± {is_std_s2:.2f}")
+
+        # Compute IS for Stage 1
+        if len(stage1_images) > 0:
+            stage1_tensor = torch.cat(stage1_images, dim=0)
+            print(f"   Computing IS for {stage1_tensor.shape[0]} Stage 1 images...")
+            is_mean_s1, is_std_s1 = self.compute_inception_score(stage1_tensor, splits=self.splits)
+            self.results['stage1_is_scores'] = [is_mean_s1]
+            self.results['stage1_is_stds'] = [is_std_s1]
+            print(f"   Stage 1 IS: {is_mean_s1:.2f} ± {is_std_s1:.2f}")
 
         elapsed = time.time() - start_time
-        print(f"\n✅ DISTS validation complete in {elapsed/3600:.2f} hours")
+        print(f"\n✅ Inception Score validation complete in {elapsed/3600:.2f} hours")
         self.save_results(elapsed)
-
-    def save_intermediate_results(self):
-        """Save intermediate results."""
-        temp_path = self.output_dir / "_intermediate_results.json"
-        with open(temp_path, 'w') as f:
-            json.dump({
-                'stage2_dists_mean': float(np.mean(self.results['stage2_dists_scores'])) if self.results['stage2_dists_scores'] else 0,
-                'stage1_dists_mean': float(np.mean(self.results['stage1_dists_scores'])) if self.results['stage1_dists_scores'] else 0,
-                'num_samples': len(self.results['per_sample_results'])
-            }, f, indent=2)
 
     def save_results(self, elapsed_time):
         """Save final results."""
-        print("\n💾 Saving DISTS results...")
+        print("\n💾 Saving Inception Score results...")
+
+        # Compute summary
+        stage2_mean = self.results['stage2_is_scores'][0] if self.results['stage2_is_scores'] else 0
+        stage2_std = self.results['stage2_is_stds'][0] if self.results['stage2_is_stds'] else 0
+        stage1_mean = self.results['stage1_is_scores'][0] if self.results['stage1_is_scores'] else 0
+        stage1_std = self.results['stage1_is_stds'][0] if self.results['stage1_is_stds'] else 0
 
         summary = {
-            'stage2_dists': {
-                'mean': float(np.mean(self.results['stage2_dists_scores'])),
-                'std': float(np.std(self.results['stage2_dists_scores'])),
-                'min': float(np.min(self.results['stage2_dists_scores'])),
-                'max': float(np.max(self.results['stage2_dists_scores']))
+            'stage2_is': {
+                'mean': float(stage2_mean),
+                'std': float(stage2_std)
             },
-            'stage1_dists': {
-                'mean': float(np.mean(self.results['stage1_dists_scores'])),
-                'std': float(np.std(self.results['stage1_dists_scores'])),
-                'min': float(np.min(self.results['stage1_dists_scores'])),
-                'max': float(np.max(self.results['stage1_dists_scores']))
+            'stage1_is': {
+                'mean': float(stage1_mean),
+                'std': float(stage1_std)
             },
-            'dists_improvement': float(np.mean(self.results['stage1_dists_scores']) - np.mean(self.results['stage2_dists_scores']))
+            'is_improvement': float(stage2_mean - stage1_mean)
         }
 
-        results_path = self.output_dir / "dists_results.json"
+        # Save JSON
+        results_path = self.output_dir / "is_results.json"
         with open(results_path, 'w') as f:
             json.dump({
                 'summary': summary,
@@ -384,46 +496,48 @@ class DISTSValidator:
                     'num_samples': self.num_samples,
                     'image_size': self.image_size,
                     'num_inference_steps': self.num_inference_steps,
-                    'guidance_scale': self.guidance_scale
+                    'guidance_scale': self.guidance_scale,
+                    'splits': self.splits
                 },
                 'execution_time_seconds': elapsed_time,
                 'timestamp': datetime.now().isoformat()
             }, f, indent=2)
 
-        csv_path = self.output_dir / "per_sample_dists.csv"
-        if self.results['per_sample_results']:
-            with open(csv_path, 'w', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=self.results['per_sample_results'][0].keys())
-                writer.writeheader()
-                writer.writerows(self.results['per_sample_results'])
-
+        # Print report
         print("\n" + "=" * 70)
-        print("📊 DISTS VALIDATION RESULTS")
+        print("📊 INCEPTION SCORE VALIDATION RESULTS")
         print("=" * 70)
-        print(f"\nStage 1 DISTS: {summary['stage1_dists']['mean']:.4f} ± {summary['stage1_dists']['std']:.4f}")
-        print(f"Stage 2 DISTS: {summary['stage2_dists']['mean']:.4f} ± {summary['stage2_dists']['std']:.4f}")
-        print(f"Improvement:   {summary['dists_improvement']:.4f} (lower is better)")
+        print(f"\nStage 1 IS: {stage1_mean:.2f} ± {stage1_std:.2f}")
+        print(f"Stage 2 IS: {stage2_mean:.2f} ± {stage2_std:.2f}")
+        print(f"Improvement: {summary['is_improvement']:.2f}")
         print("=" * 70)
         print(f"\nResults saved to: {self.output_dir}")
         print(f"  - JSON: {results_path}")
-        print(f"  - CSV:  {csv_path}")
+
+
+def entropy(pyx, py):
+    """Compute KL divergence between p(y|x) and p(y)."""
+    # pyx: p(y|x) - conditional distribution
+    # py: p(y) - marginal distribution
+    return np.sum(pyx * (np.log(pyx + 1e-10) - np.log(py + 1e-10)))
 
 
 def main():
-    parser = argparse.ArgumentParser(description="DISTS Metric Test on Full Sketchy Test Set")
+    parser = argparse.ArgumentParser(description="Inception Score (IS) Metric Test on Full Sketchy Test Set")
     parser.add_argument("--stage1_checkpoint", type=str, required=True)
     parser.add_argument("--stage2_checkpoint", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, default="./results/dists_test")
+    parser.add_argument("--output_dir", type=str, default="./results/is_test")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_samples", type=int, default=-1)
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--num_inference_steps", type=int, default=50)
     parser.add_argument("--guidance_scale", type=float, default=7.5)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--splits", type=int, default=10, help="Number of splits for IS computation")
 
     args = parser.parse_args()
 
-    validator = DISTSValidator(
+    validator = InceptionScoreValidator(
         stage1_checkpoint=args.stage1_checkpoint,
         stage2_checkpoint=args.stage2_checkpoint,
         output_dir=args.output_dir,
@@ -432,7 +546,8 @@ def main():
         image_size=args.image_size,
         num_inference_steps=args.num_inference_steps,
         guidance_scale=args.guidance_scale,
-        device=args.device
+        device=args.device,
+        splits=args.splits
     )
 
     validator.validate()

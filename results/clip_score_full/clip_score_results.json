@@ -1,0 +1,29 @@
+{
+  "summary": {
+    "stage2_clip_score": {
+      "mean": 32.42228211363364,
+      "std": 2.502770093927542,
+      "min": 18.56689453125,
+      "max": 41.748046875
+    },
+    "stage1_clip_score": {
+      "mean": 32.377416703062416,
+      "std": 2.460603436698913,
+      "min": 19.23828125,
+      "max": 41.357421875
+    },
+    "clip_improvement": 0.044865410571226505
+  },
+  "config": {
+    "stage1_checkpoint": "/workspace/checkpoints/stage1/epoch_18.pt",
+    "stage2_checkpoint": "/workspace/checkpoints/stage2/epoch_6.pt",
+    "num_samples": 11484,
+    "image_size": 256,
+    "num_inference_steps": 50,
+    "guidance_scale": 7.5,
+    "clip_model": "ViT-B/32",
+    "optimize_prompts": true
+  },
+  "execution_time_seconds": 11466.066823244095,
+  "timestamp": "2026-04-09T22:58:29.872833"
+}

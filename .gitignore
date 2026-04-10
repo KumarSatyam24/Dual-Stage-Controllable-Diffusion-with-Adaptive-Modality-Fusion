@@ -100,7 +100,8 @@ validation_results/
 validation_examples/
 wandb/
 logs/
-results/
+results/ablation_epoch6/
+
 # Tensorboard
 tensorboard/
 events.out.tfevents*

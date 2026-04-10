@@ -12,7 +12,7 @@ python test_metrics/test_ssim_full.py \
     --num_samples 100
 
 # Test all metrics (quick test with 100 samples)
-for metric in ssim psnr lpips clip_score edge_similarity fid_kid dists; do
+for metric in ssim psnr lpips clip_score edge_similarity fid_kid dists inception_score; do
     python test_metrics/test_${metric}_full.py \
         --stage1_checkpoint /workspace/checkpoints/stage1/epoch_18.pt \
         --stage2_checkpoint /workspace/checkpoints/stage2/epoch_6.pt \
@@ -39,6 +39,7 @@ done
 |--------|------|-------|----------------|--------------|
 | **FID** | `test_fid_kid_full.py` | [0, ∞] | Lower is better (distribution distance) | torch-fidelity |
 | **KID** | `test_fid_kid_full.py` | [0, ∞] | Lower is better (distribution distance) | torch-fidelity |
+| **IS** | `test_inception_score_full.py` | [1, ∞] | Higher is better (quality + diversity) | torchvision |
 | **DISTS** | `test_dists_full.py` | [0, 1] | Lower is better (perceptual similarity) | DISTS-pytorch |
 
 ## Metric Descriptions
@@ -95,6 +96,16 @@ Measures distance between feature distributions of real and generated images usi
 - **Range**: 0 to ∞
 - **Best**: Lower values (good: <50, excellent: <20)
 - **When to use**: Overall distribution quality, diversity assessment
+
+### IS (Inception Score)
+
+Measures both the quality (confidence of class predictions) and diversity of generated images using Inception V3.
+Higher IS indicates more realistic and diverse images.
+
+- **Range**: 1.0 to ∞ (typical: 2-10+)
+- **Best**: Higher values (good: >5, excellent: >8)
+- **Formula**: IS = exp(E_x[KL(p(y|x) || p(y))])
+- **When to use**: Overall quality assessment without ground truth
 
 ### KID (Kernel Inception Distance)
 
@@ -210,6 +221,7 @@ All scripts compute metrics for both Stage 1 and Stage 2 outputs, allowing you t
 | CLIP Score | 0.25-0.30 | 0.28-0.32 | +0.03 |
 | Edge Similarity | 0.65-0.75 | 0.75-0.85 | +0.10 |
 | FID | 40-60 | 20-40 | -20 |
+| IS | 4.0-6.0 | 5.5-7.5 | +1.5 |
 | DISTS | 0.15-0.25 | 0.10-0.15 | -0.05 |
 
 ## Troubleshooting
@@ -238,4 +250,5 @@ python -c "import torch_fidelity; print('torch-fidelity OK')"
 - **CLIP**: Radford et al., "Learning Transferable Visual Models From Natural Language Supervision", ICML 2021
 - **FID**: Heusel et al., "GANs Trained by a Two Time-Scale Update Rule", NeurIPS 2017
 - **KID**: Bińkowski et al., "Demystifying MMD GANs", ICLR 2018
+- **IS**: Salimans et al., "Improved Techniques for Training GANs", NeurIPS 2016
 - **DISTS**: Ding et al., "Image Quality Assessment: Unifying Structure and Texture Similarity", TPAMI 2022

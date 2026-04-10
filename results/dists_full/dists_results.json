@@ -1,0 +1,27 @@
+{
+  "summary": {
+    "stage2_dists": {
+      "mean": 0.37705731013532034,
+      "std": 0.030492799487197186,
+      "min": 0.29011431336402893,
+      "max": 0.47808077931404114
+    },
+    "stage1_dists": {
+      "mean": 0.3784855611399135,
+      "std": 0.031553429613107656,
+      "min": 0.2891499400138855,
+      "max": 0.47874540090560913
+    },
+    "dists_improvement": 0.0014282510045931507
+  },
+  "config": {
+    "stage1_checkpoint": "/workspace/checkpoints/stage1/epoch_18.pt",
+    "stage2_checkpoint": "/workspace/checkpoints/stage2/epoch_6.pt",
+    "num_samples": 11214,
+    "image_size": 256,
+    "num_inference_steps": 50,
+    "guidance_scale": 7.5
+  },
+  "execution_time_seconds": 11184.944284677505,
+  "timestamp": "2026-04-10T02:34:39.713555"
+}
