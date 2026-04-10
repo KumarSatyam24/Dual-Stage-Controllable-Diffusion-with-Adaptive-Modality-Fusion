@@ -42,7 +42,7 @@ The key idea is to avoid uniform text conditioning across the whole image by mod
   - `AdaptiveModalityFusion`: combines sketch region features and text-aligned features per timestep.
 
 ### Data and graph construction
-- `src/data/sketch_extraction.py`: sketch extraction utilities (Canny/XDoG; HED fallback currently uses Canny).
+- `src/data/sketch_extraction.py`: sketch extraction utilities (Canny/XDoG; `hed` option is currently a fallback to Canny).
 - `src/data/region_extraction.py`: connected-components-based region extraction with filtering/merging.
 - `src/data/region_graph.py`: region graph builder (`adjacency`, `knn`, `radius`, `hybrid`) and node features.
 
@@ -75,10 +75,10 @@ The key idea is to avoid uniform text conditioning across the whole image by mod
 
 The following values are extracted from checked-in result files under `results/`.
 
-| Metric | Stage 1 | Stage 2 | Delta (Stage2-Stage1) | Source |
+| Metric | Stage 1 | Stage 2 | Change | Source |
 |---|---:|---:|---:|---|
 | CLIP Score (mean) | 32.3774 | 32.4223 | +0.0449 | `results/clip_score_full/clip_score_results.json` |
-| DISTS (mean, lower better) | 0.3785 | 0.3771 | +0.0014 improvement | `results/dists_full/dists_results.json` |
+| DISTS (mean, lower better) | 0.3785 | 0.3771 | -0.0014 (reduction) | `results/dists_full/dists_results.json` |
 | PSNR | 9.8789 | 9.9652 | +0.0863 | `results/lpips_psnr_ssim_test/test_lpips_psnr_ssim.json` |
 | SSIM | 0.4340 | 0.4352 | +0.0012 | `results/lpips_psnr_ssim_test/test_lpips_psnr_ssim.json` |
 | LPIPS (lower better) | 0.6242 | 0.6228 | +0.0014 improvement | `results/lpips_psnr_ssim_test/test_lpips_psnr_ssim.json` |
@@ -90,7 +90,11 @@ Additional distribution metrics:
 - **KID mean:** 0.003278
 - Source: `results/fid_kid_test/fid_kid_results.json`
 
-> Note: some metrics show modest improvement, while edge similarity is effectively neutral/slightly lower in this snapshot.
+> Note: some metrics show modest improvement, while edge similarity is effectively neutral (very small decrease in this snapshot).
+>
+> CLIP scores above are on the script's scaled reporting convention (not raw cosine values).
+>
+> PSNR values are reported as produced by the current evaluation pipeline and should be compared primarily stage-to-stage within this project setup.
 
 ---
 
