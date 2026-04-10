@@ -1,0 +1,29 @@
+{
+  "summary": {
+    "stage2_edge_similarity": {
+      "mean": 0.21104073404347742,
+      "std": 0.20494940006249485,
+      "min": -0.011048589184470459,
+      "max": 0.9472304954235717
+    },
+    "stage1_edge_similarity": {
+      "mean": 0.2112713025882717,
+      "std": 0.2052001777529531,
+      "min": -0.008187733058535778,
+      "max": 0.9469935062794314
+    },
+    "edge_improvement": -0.00023056854479427957
+  },
+  "config": {
+    "stage1_checkpoint": "/workspace/checkpoints/stage1/epoch_18.pt",
+    "stage2_checkpoint": "/workspace/checkpoints/stage2/epoch_6.pt",
+    "num_samples": 11345,
+    "image_size": 256,
+    "num_inference_steps": 50,
+    "guidance_scale": 7.5,
+    "canny_low": 50,
+    "canny_high": 150
+  },
+  "execution_time_seconds": 18972.25750732422,
+  "timestamp": "2026-04-10T19:57:39.729300"
+}

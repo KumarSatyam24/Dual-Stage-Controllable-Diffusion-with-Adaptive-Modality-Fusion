@@ -30,11 +30,31 @@ from datetime import datetime
 import time
 import warnings
 import cv2
+import logging
+import sys
 warnings.filterwarnings('ignore')
 
 from skimage.metrics import structural_similarity as compute_ssim
 from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
 from transformers import CLIPTextModel, CLIPTokenizer
+
+
+def optimize_prompt(prompt, category):
+    """
+    Optimizes a simple prompt for better CLIP score alignment.
+
+    Args:
+        prompt: Original simple prompt (e.g., "A photo of a dog")
+        category: Object category (e.g., "dog")
+
+    Returns:
+        Optimized prompt for CLIP
+    """
+    return (
+        f"A high-quality, realistic photograph of a {category}, "
+        f"based on the description: {prompt}, with natural lighting, "
+        f"sharp details, and accurate colors."
+    )
 
 
 class EdgeSimilarityValidator:
@@ -68,40 +88,51 @@ class EdgeSimilarityValidator:
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Setup logging
+        log_file = self.output_dir / "edge_similarity.log"
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s [%(levelname)s] %(message)s',
+            handlers=[
+                logging.FileHandler(log_file),
+                logging.StreamHandler(sys.stdout)
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
+
         self.results = {
             'stage2_edge_scores': [],
             'stage1_edge_scores': [],
             'per_sample_results': []
         }
 
-        print("=" * 70)
-        print("📊 Edge Similarity Metric Validation - Full Sketchy Test Set")
-        print("=" * 70)
-        print(f"   Stage 1: {self.stage1_checkpoint}")
-        print(f"   Stage 2: {self.stage2_checkpoint}")
-        print(f"   Output:  {self.output_dir}")
-        print(f"   Device:  {device}")
-        print(f"   Canny:   low={canny_low}, high={canny_high}")
-        print("=" * 70)
-        print()
+        self.logger.info("=" * 70)
+        self.logger.info("📊 Edge Similarity Metric Validation - Full Sketchy Test Set")
+        self.logger.info("=" * 70)
+        self.logger.info(f"   Stage 1: {self.stage1_checkpoint}")
+        self.logger.info(f"   Stage 2: {self.stage2_checkpoint}")
+        self.logger.info(f"   Output:  {self.output_dir}")
+        self.logger.info(f"   Device:  {device}")
+        self.logger.info(f"   Canny:   low={canny_low}, high={canny_high}")
+        self.logger.info("=" * 70)
 
         self.load_models()
         self.load_dataset()
 
     def load_models(self):
         """Load Stage 1 and Stage 2 models."""
-        print("📦 Loading models...")
+        self.logger.info("📦 Loading models...")
         model_name = "runwayml/stable-diffusion-v1-5"
 
         self.vae = AutoencoderKL.from_pretrained(
             model_name, subfolder="vae"
         ).to(self.device).eval()
-        print("   ✅ VAE loaded")
+        self.logger.info("   ✅ VAE loaded")
 
         self.text_encoder = CLIPTextModel.from_pretrained(
             model_name, subfolder="text_encoder"
         ).to(self.device).eval()
-        print("   ✅ Text Encoder loaded")
+        self.logger.info("   ✅ Text Encoder loaded")
 
         self.tokenizer = CLIPTokenizer.from_pretrained(
             model_name, subfolder="tokenizer"
@@ -111,7 +142,7 @@ class EdgeSimilarityValidator:
             model_name, subfolder="scheduler"
         )
 
-        print("\n   Loading Stage 1...")
+        self.logger.info("\n   Loading Stage 1...")
         from src.models.stage1_diffusion import Stage1SketchGuidedDiffusion
 
         self.stage1 = Stage1SketchGuidedDiffusion(
@@ -124,9 +155,9 @@ class EdgeSimilarityValidator:
 
         ckpt1 = torch.load(self.stage1_checkpoint, map_location="cpu", weights_only=False)
         self.stage1.load_state_dict(ckpt1["model_state_dict"], strict=False)
-        print(f"   ✅ Stage 1 loaded")
+        self.logger.info(f"   ✅ Stage 1 loaded")
 
-        print("\n   Loading Stage 2...")
+        self.logger.info("\n   Loading Stage 2...")
         from src.models.stage2_refinement import Stage2SemanticRefinement
 
         unet = UNet2DConditionModel.from_pretrained(
@@ -137,12 +168,11 @@ class EdgeSimilarityValidator:
 
         ckpt2 = torch.load(self.stage2_checkpoint, map_location="cpu", weights_only=False)
         self.stage2.load_state_dict(ckpt2["model_state_dict"], strict=False)
-        print(f"   ✅ Stage 2 loaded")
-        print()
+        self.logger.info(f"   ✅ Stage 2 loaded")
 
     def load_dataset(self):
         """Load Sketchy test dataset."""
-        print("📁 Loading dataset...")
+        self.logger.info("📁 Loading dataset...")
         from src.datasets.sketchy_dataset import SketchyDataset
 
         self.dataset = SketchyDataset(
@@ -157,9 +187,8 @@ class EdgeSimilarityValidator:
         else:
             self.num_samples = min(self.num_samples, len(self.dataset))
 
-        print(f"   ✅ Dataset loaded: {len(self.dataset)} total samples")
-        print(f"   📊 Will evaluate: {self.num_samples} samples")
-        print()
+        self.logger.info(f"   ✅ Dataset loaded: {len(self.dataset)} total samples")
+        self.logger.info(f"   📊 Will evaluate: {self.num_samples} samples")
 
     @torch.no_grad()
     def generate(self, sketch, text_prompt, region_graphs):
@@ -219,6 +248,8 @@ class EdgeSimilarityValidator:
             text_prompt = [text_prompt]
 
         B = len(text_prompt)
+        # Duplicate region_graphs for CFG (same as how latents are duplicated in Stage 1)
+        region_graphs = region_graphs + region_graphs
         stage1_latent = self.vae.encode(stage1_output * 2 - 1).latent_dist.sample() * 0.18215
 
         text_inputs = self.tokenizer(text_prompt, padding="max_length",
@@ -255,7 +286,7 @@ class EdgeSimilarityValidator:
         refined = (refined / 2 + 0.5).clamp(0, 1)
         return refined
 
-    def compute_edge_similarity(self, generated, ground_truth):
+    def compute_edge_similarity(self, generated, ground_truth, return_individual=False):
         """Compute edge similarity using Canny edge detection."""
         gen_np = generated.cpu().numpy()
         gt_np = ground_truth.cpu().numpy()
@@ -277,14 +308,15 @@ class EdgeSimilarityValidator:
             edge_sim = compute_ssim(gt_edges, gen_edges, data_range=255)
             edge_scores.append(edge_sim)
 
+        if return_individual:
+            return edge_scores
         return np.mean(edge_scores)
 
     def validate(self):
         """Run validation on full test set."""
-        print("🔄 Starting Edge Similarity validation...")
-        print(f"   Total samples: {self.num_samples}")
-        print(f"   Batch size: {self.batch_size}")
-        print()
+        self.logger.info("🔄 Starting Edge Similarity validation...")
+        self.logger.info(f"   Total samples: {self.num_samples}")
+        self.logger.info(f"   Batch size: {self.batch_size}")
 
         start_time = time.time()
         num_batches = (self.num_samples + self.batch_size - 1) // self.batch_size
@@ -298,48 +330,52 @@ class EdgeSimilarityValidator:
                 try:
                     batch_data.append(self.dataset[i])
                 except Exception as e:
-                    print(f"Error loading sample {i}: {e}")
+                    self.logger.error(f"Error loading sample {i}: {e}")
                     continue
 
             if len(batch_data) == 0:
                 continue
 
-            sketches = torch.stack([d['sketch'] for d in batch_data])
-            photos_gt = torch.stack([d['photo'] for d in batch_data])
-            prompts = [d['text_prompt'] for d in batch_data]
+            sketches = torch.stack([d['sketch'] for d in batch_data]).to(self.device)
+            photos_gt = torch.stack([d['photo'] for d in batch_data]).to(self.device)
+            raw_prompts = [d['text_prompt'] for d in batch_data]
             file_ids = [d['file_id'] for d in batch_data]
             categories = [d['category'] for d in batch_data]
             region_graphs = [d['region_graph'] for d in batch_data]
+            prompts = [optimize_prompt(p, c) for p, c in zip(raw_prompts, categories)]
 
             photos_gt = (photos_gt + 1) / 2
 
             try:
                 generated, stage1 = self.generate(sketches, prompts, region_graphs)
 
-                edge_stage2 = self.compute_edge_similarity(generated, photos_gt)
-                edge_stage1 = self.compute_edge_similarity(stage1, photos_gt)
+                edge_scores_stage2 = self.compute_edge_similarity(generated, photos_gt, return_individual=True)
+                edge_scores_stage1 = self.compute_edge_similarity(stage1, photos_gt, return_individual=True)
 
-                self.results['stage2_edge_scores'].append(edge_stage2)
-                self.results['stage1_edge_scores'].append(edge_stage1)
+                self.results['stage2_edge_scores'].extend(edge_scores_stage2)
+                self.results['stage1_edge_scores'].extend(edge_scores_stage1)
 
                 for i, file_id in enumerate(file_ids):
                     self.results['per_sample_results'].append({
                         'file_id': file_id,
                         'category': categories[i],
-                        'prompt': prompts[i],
-                        'stage2_edge_similarity': edge_stage2,
-                        'stage1_edge_similarity': edge_stage1
+                        'raw_prompt': raw_prompts[i],
+                        'optimized_prompt': prompts[i],
+                        'stage2_edge_similarity': edge_scores_stage2[i],
+                        'stage1_edge_similarity': edge_scores_stage1[i]
                     })
 
             except Exception as e:
-                print(f"Error processing batch {batch_idx}: {e}")
+                import traceback
+                self.logger.error(f"Error processing batch {batch_idx}: {e}")
+                self.logger.error(traceback.format_exc())
                 continue
 
             if (batch_idx + 1) % 10 == 0:
                 self.save_intermediate_results()
 
         elapsed = time.time() - start_time
-        print(f"\n✅ Edge Similarity validation complete in {elapsed/3600:.2f} hours")
+        self.logger.info(f"\n✅ Edge Similarity validation complete in {elapsed/3600:.2f} hours")
         self.save_results(elapsed)
 
     def save_intermediate_results(self):
@@ -354,23 +390,31 @@ class EdgeSimilarityValidator:
 
     def save_results(self, elapsed_time):
         """Save final results."""
-        print("\n💾 Saving Edge Similarity results...")
+        self.logger.info("\n💾 Saving Edge Similarity results...")
 
-        summary = {
-            'stage2_edge_similarity': {
-                'mean': float(np.mean(self.results['stage2_edge_scores'])),
-                'std': float(np.std(self.results['stage2_edge_scores'])),
-                'min': float(np.min(self.results['stage2_edge_scores'])),
-                'max': float(np.max(self.results['stage2_edge_scores']))
-            },
-            'stage1_edge_similarity': {
-                'mean': float(np.mean(self.results['stage1_edge_scores'])),
-                'std': float(np.std(self.results['stage1_edge_scores'])),
-                'min': float(np.min(self.results['stage1_edge_scores'])),
-                'max': float(np.max(self.results['stage1_edge_scores']))
-            },
-            'edge_improvement': float(np.mean(self.results['stage2_edge_scores']) - np.mean(self.results['stage1_edge_scores']))
-        }
+        if len(self.results['stage2_edge_scores']) == 0:
+            self.logger.error("No results to save - all batches failed")
+            summary = {
+                'stage2_edge_similarity': {'mean': 0, 'std': 0, 'min': 0, 'max': 0},
+                'stage1_edge_similarity': {'mean': 0, 'std': 0, 'min': 0, 'max': 0},
+                'edge_improvement': 0
+            }
+        else:
+            summary = {
+                'stage2_edge_similarity': {
+                    'mean': float(np.mean(self.results['stage2_edge_scores'])),
+                    'std': float(np.std(self.results['stage2_edge_scores'])),
+                    'min': float(np.min(self.results['stage2_edge_scores'])),
+                    'max': float(np.max(self.results['stage2_edge_scores']))
+                },
+                'stage1_edge_similarity': {
+                    'mean': float(np.mean(self.results['stage1_edge_scores'])),
+                    'std': float(np.std(self.results['stage1_edge_scores'])),
+                    'min': float(np.min(self.results['stage1_edge_scores'])),
+                    'max': float(np.max(self.results['stage1_edge_scores']))
+                },
+                'edge_improvement': float(np.mean(self.results['stage2_edge_scores']) - np.mean(self.results['stage1_edge_scores']))
+            }
 
         results_path = self.output_dir / "edge_similarity_results.json"
         with open(results_path, 'w') as f:
@@ -397,16 +441,16 @@ class EdgeSimilarityValidator:
                 writer.writeheader()
                 writer.writerows(self.results['per_sample_results'])
 
-        print("\n" + "=" * 70)
-        print("📊 EDGE SIMILARITY VALIDATION RESULTS")
-        print("=" * 70)
-        print(f"\nStage 1 Edge Sim: {summary['stage1_edge_similarity']['mean']:.4f} ± {summary['stage1_edge_similarity']['std']:.4f}")
-        print(f"Stage 2 Edge Sim: {summary['stage2_edge_similarity']['mean']:.4f} ± {summary['stage2_edge_similarity']['std']:.4f}")
-        print(f"Improvement:      {summary['edge_improvement']:.4f}")
-        print("=" * 70)
-        print(f"\nResults saved to: {self.output_dir}")
-        print(f"  - JSON: {results_path}")
-        print(f"  - CSV:  {csv_path}")
+        self.logger.info("\n" + "=" * 70)
+        self.logger.info("📊 EDGE SIMILARITY VALIDATION RESULTS")
+        self.logger.info("=" * 70)
+        self.logger.info(f"\nStage 1 Edge Sim: {summary['stage1_edge_similarity']['mean']:.4f} ± {summary['stage1_edge_similarity']['std']:.4f}")
+        self.logger.info(f"Stage 2 Edge Sim: {summary['stage2_edge_similarity']['mean']:.4f} ± {summary['stage2_edge_similarity']['std']:.4f}")
+        self.logger.info(f"Improvement:      {summary['edge_improvement']:.4f}")
+        self.logger.info("=" * 70)
+        self.logger.info(f"\nResults saved to: {self.output_dir}")
+        self.logger.info(f"  - JSON: {results_path}")
+        self.logger.info(f"  - CSV:  {csv_path}")
 
 
 def main():

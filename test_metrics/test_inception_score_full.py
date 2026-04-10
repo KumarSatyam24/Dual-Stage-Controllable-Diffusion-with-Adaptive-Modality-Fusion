@@ -34,10 +34,29 @@ import csv
 from datetime import datetime
 import time
 import warnings
+from scipy.stats import entropy
 warnings.filterwarnings('ignore')
 
 from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
 from transformers import CLIPTextModel, CLIPTokenizer
+
+
+def optimize_prompt(prompt, category):
+    """
+    Optimizes a simple prompt for better CLIP score alignment.
+
+    Args:
+        prompt: Original simple prompt (e.g., "A photo of a dog")
+        category: Object category (e.g., "dog")
+
+    Returns:
+        Optimized prompt for CLIP
+    """
+    return (
+        f"A high-quality, realistic photograph of a {category}, "
+        f"based on the description: {prompt}, with natural lighting, "
+        f"sharp details, and accurate colors."
+    )
 
 
 def get_inception_model(device='cuda'):
@@ -84,10 +103,10 @@ class InceptionScoreValidator:
 
         # Initialize results storage
         self.results = {
-            'stage2_is_scores': [],
-            'stage2_is_stds': [],
-            'stage1_is_scores': [],
-            'stage1_is_stds': [],
+            'stage2_is_mean': None,
+            'stage2_is_std': None,
+            'stage1_is_mean': None,
+            'stage1_is_std': None,
             'per_sample_results': []
         }
 
@@ -193,18 +212,30 @@ class InceptionScoreValidator:
         print()
 
     @torch.no_grad()
-    def generate(self, sketch, text_prompt, region_graphs):
-        """Generate image using full pipeline."""
+    def generate(self, sketch, text_prompt, region_graphs, categories=None):
+        """Generate image using full pipeline with optimized prompts."""
         if isinstance(text_prompt, str):
             text_prompt = [text_prompt]
+            if categories is None:
+                categories = [None]
+        elif categories is None:
+            categories = [None] * len(text_prompt)
+
+        # Optimize prompts for better CLIP alignment
+        optimized_prompts = []
+        for prompt, category in zip(text_prompt, categories):
+            if category is not None:
+                optimized_prompts.append(optimize_prompt(prompt, category))
+            else:
+                optimized_prompts.append(prompt)
 
         sketch = sketch.to(self.device)
 
         # Stage 1: Sketch-guided generation
-        stage1_output = self._run_stage1(sketch, text_prompt)
+        stage1_output = self._run_stage1(sketch, optimized_prompts)
 
         # Stage 2: Semantic refinement
-        stage2_output = self._run_stage2(stage1_output, sketch, text_prompt, region_graphs)
+        stage2_output = self._run_stage2(stage1_output, sketch, optimized_prompts, region_graphs)
 
         return stage2_output, stage1_output
 
@@ -295,9 +326,7 @@ class InceptionScoreValidator:
         )
         uncond_embeddings = self.text_encoder(uncond_inputs.input_ids.to(self.device))[0]
 
-        scheduler = DDIMScheduler.from_pretrained(
-            "runwayml/stable-diffusion-v1-5", subfolder="scheduler"
-        )
+        scheduler = self.scheduler
         scheduler.set_timesteps(30)
         timesteps = scheduler.timesteps[-15:]
 
@@ -310,10 +339,22 @@ class InceptionScoreValidator:
             encoder_hidden_states = torch.cat([uncond_embeddings, text_embeddings])
             stage1_latent_cfg = torch.cat([stage1_latent] * 2)
 
+            # Duplicate region_graphs for CFG (uncond + cond)
+            region_graphs_cfg = region_graphs + region_graphs
+
+            # Ensure timestep is a tensor on the correct device
+            if isinstance(t, torch.Tensor):
+                t_tensor = t.to(self.device)
+            else:
+                t_tensor = torch.tensor(t, device=self.device)
+            # Expand timestep to batch size (B*2 for CFG)
+            if t_tensor.dim() == 0:
+                t_tensor = t_tensor.unsqueeze(0).expand(latent_model_input.shape[0])
+
             noise_pred = self.stage2(
                 latent_model_input,
-                t.to(self.device),
-                region_graphs,
+                t_tensor,
+                region_graphs_cfg,
                 encoder_hidden_states,
                 stage1_latents=stage1_latent_cfg,
                 return_dict=False
@@ -344,13 +385,16 @@ class InceptionScoreValidator:
         """
         N = images.shape[0]
 
+        # Move images to the same device as Inception model
+        images = images.to(self.device)
+
         # Resize and normalize for Inception
         # Inception expects 299x299 images
         images_resized = F.interpolate(images, size=(299, 299), mode='bilinear', align_corners=False)
 
         # Normalize with ImageNet stats
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(images.device)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(images.device)
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(self.device)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(self.device)
         images_normalized = (images_resized - mean) / std
 
         # Get predictions
@@ -365,15 +409,13 @@ class InceptionScoreValidator:
 
         preds = np.concatenate(preds, axis=0)
 
-        # Compute IS
+        # Compute IS using vectorized entropy
         split_scores = []
         for k in range(splits):
             part = preds[k * (N // splits): (k + 1) * (N // splits), :]
             py = np.mean(part, axis=0)  # marginal distribution p(y)
-            scores = []
-            for i in range(part.shape[0]):
-                pyx = part[i, :]  # conditional distribution p(y|x)
-                scores.append(entropy(pyx, py))
+            # Vectorized KL divergence computation
+            scores = entropy(part.T, py[:, None])
             split_scores.append(np.exp(np.mean(scores)))
 
         return np.mean(split_scores), np.std(split_scores)
@@ -417,7 +459,7 @@ class InceptionScoreValidator:
             region_graphs = [d['region_graph'] for d in batch_data]
 
             try:
-                generated, stage1 = self.generate(sketches, prompts, region_graphs)
+                generated, stage1 = self.generate(sketches, prompts, region_graphs, categories)
 
                 stage2_images.append(generated.cpu())
                 stage1_images.append(stage1.cpu())
@@ -446,8 +488,8 @@ class InceptionScoreValidator:
             stage2_tensor = torch.cat(stage2_images, dim=0)
             print(f"   Computing IS for {stage2_tensor.shape[0]} Stage 2 images...")
             is_mean_s2, is_std_s2 = self.compute_inception_score(stage2_tensor, splits=self.splits)
-            self.results['stage2_is_scores'] = [is_mean_s2]
-            self.results['stage2_is_stds'] = [is_std_s2]
+            self.results['stage2_is_mean'] = is_mean_s2
+            self.results['stage2_is_std'] = is_std_s2
             print(f"   Stage 2 IS: {is_mean_s2:.2f} ± {is_std_s2:.2f}")
 
         # Compute IS for Stage 1
@@ -455,8 +497,8 @@ class InceptionScoreValidator:
             stage1_tensor = torch.cat(stage1_images, dim=0)
             print(f"   Computing IS for {stage1_tensor.shape[0]} Stage 1 images...")
             is_mean_s1, is_std_s1 = self.compute_inception_score(stage1_tensor, splits=self.splits)
-            self.results['stage1_is_scores'] = [is_mean_s1]
-            self.results['stage1_is_stds'] = [is_std_s1]
+            self.results['stage1_is_mean'] = is_mean_s1
+            self.results['stage1_is_std'] = is_std_s1
             print(f"   Stage 1 IS: {is_mean_s1:.2f} ± {is_std_s1:.2f}")
 
         elapsed = time.time() - start_time
@@ -468,10 +510,10 @@ class InceptionScoreValidator:
         print("\n💾 Saving Inception Score results...")
 
         # Compute summary
-        stage2_mean = self.results['stage2_is_scores'][0] if self.results['stage2_is_scores'] else 0
-        stage2_std = self.results['stage2_is_stds'][0] if self.results['stage2_is_stds'] else 0
-        stage1_mean = self.results['stage1_is_scores'][0] if self.results['stage1_is_scores'] else 0
-        stage1_std = self.results['stage1_is_stds'][0] if self.results['stage1_is_stds'] else 0
+        stage2_mean = self.results['stage2_is_mean'] if self.results['stage2_is_mean'] is not None else 0
+        stage2_std = self.results['stage2_is_std'] if self.results['stage2_is_std'] is not None else 0
+        stage1_mean = self.results['stage1_is_mean'] if self.results['stage1_is_mean'] is not None else 0
+        stage1_std = self.results['stage1_is_std'] if self.results['stage1_is_std'] is not None else 0
 
         summary = {
             'stage2_is': {
@@ -515,11 +557,6 @@ class InceptionScoreValidator:
         print(f"  - JSON: {results_path}")
 
 
-def entropy(pyx, py):
-    """Compute KL divergence between p(y|x) and p(y)."""
-    # pyx: p(y|x) - conditional distribution
-    # py: p(y) - marginal distribution
-    return np.sum(pyx * (np.log(pyx + 1e-10) - np.log(py + 1e-10)))
 
 
 def main():

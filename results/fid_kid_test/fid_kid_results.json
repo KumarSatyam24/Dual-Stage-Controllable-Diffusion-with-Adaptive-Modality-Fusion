@@ -1,0 +1,19 @@
+{
+  "results": {
+    "custom_kid_mean": 0.015037763118743896,
+    "custom_kid_std": 1.364412682325792e-07
+  },
+  "config": {
+    "stage1_checkpoint": "/workspace/checkpoints/stage1/epoch_18.pt",
+    "stage2_checkpoint": "/workspace/checkpoints/stage2/epoch_6.pt",
+    "num_samples": 10,
+    "image_size": 256,
+    "num_inference_steps": 50,
+    "guidance_scale": 7.5,
+    "compute_fid": true,
+    "compute_kid": true,
+    "kid_subset_size": 100
+  },
+  "execution_time_seconds": 23.635138511657715,
+  "timestamp": "2026-04-10T15:57:17.087714"
+}

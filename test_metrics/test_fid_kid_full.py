@@ -17,6 +17,7 @@ Usage:
         --num_samples -1
 """
 
+
 import sys
 from pathlib import Path
 project_root = Path(__file__).parent.parent.absolute()
@@ -95,6 +96,8 @@ class KIDMetric:
         n = real_features.size(0)
         m = fake_features.size(0)
         subset_size = min(max_subset_size, n, m)
+        if subset_size < 2:
+            return float("nan"), float("nan")
 
         kids = []
         for _ in range(num_subsets):
@@ -181,29 +184,46 @@ class FIDKIDValidator:
         self.load_models()
         self.load_dataset()
 
+
     def load_models(self):
         """Load Stage 1 and Stage 2 models."""
         print("📦 Loading models...")
         model_name = "runwayml/stable-diffusion-v1-5"
 
+        # Ensure CUDA availability
+        if self.device.startswith("cuda") and not torch.cuda.is_available():
+            print("⚠️ CUDA not available. Falling back to CPU.")
+            self.device = "cpu"
+
+        # ------------------ VAE ------------------
         self.vae = AutoencoderKL.from_pretrained(
             model_name, subfolder="vae"
         ).to(self.device).eval()
         print("   ✅ VAE loaded")
 
+        # ------------------ Text Encoder ------------------
         self.text_encoder = CLIPTextModel.from_pretrained(
             model_name, subfolder="text_encoder"
         ).to(self.device).eval()
         print("   ✅ Text Encoder loaded")
 
+        # ------------------ Tokenizer ------------------
         self.tokenizer = CLIPTokenizer.from_pretrained(
             model_name, subfolder="tokenizer"
         )
 
+        # ------------------ Schedulers ------------------
         self.scheduler = DDIMScheduler.from_pretrained(
             model_name, subfolder="scheduler"
         )
+        print("   ✅ Stage 1 Scheduler loaded")
 
+        self.stage2_scheduler = DDIMScheduler.from_pretrained(
+            model_name, subfolder="scheduler"
+        )
+        print("   ✅ Stage 2 Scheduler loaded")
+
+        # ------------------ Stage 1 ------------------
         print("\n   Loading Stage 1...")
         from src.models.stage1_diffusion import Stage1SketchGuidedDiffusion
 
@@ -215,10 +235,15 @@ class FIDKIDValidator:
             lora_rank=8
         ).to(self.device).eval()
 
-        ckpt1 = torch.load(self.stage1_checkpoint, map_location="cpu", weights_only=False)
+        ckpt1 = torch.load(
+            self.stage1_checkpoint,
+            map_location="cpu",
+            weights_only=False
+        )
         self.stage1.load_state_dict(ckpt1["model_state_dict"], strict=False)
-        print(f"   ✅ Stage 1 loaded")
+        print("   ✅ Stage 1 loaded")
 
+        # ------------------ Stage 2 ------------------
         print("\n   Loading Stage 2...")
         from src.models.stage2_refinement import Stage2SemanticRefinement
 
@@ -228,10 +253,16 @@ class FIDKIDValidator:
 
         self.stage2 = Stage2SemanticRefinement(unet=unet).to(self.device).eval()
 
-        ckpt2 = torch.load(self.stage2_checkpoint, map_location="cpu", weights_only=False)
+        ckpt2 = torch.load(
+            self.stage2_checkpoint,
+            map_location="cpu",
+            weights_only=False
+        )
         self.stage2.load_state_dict(ckpt2["model_state_dict"], strict=False)
-        print(f"   ✅ Stage 2 loaded")
-        print()
+        print("   ✅ Stage 2 loaded\n")
+
+
+
 
     def load_dataset(self):
         """Load Sketchy test dataset."""
@@ -322,10 +353,12 @@ class FIDKIDValidator:
             max_length=self.tokenizer.model_max_length, return_tensors="pt")
         uncond_embeddings = self.text_encoder(uncond_inputs.input_ids.to(self.device))[0]
 
-        scheduler = DDIMScheduler.from_pretrained("runwayml/stable-diffusion-v1-5", subfolder="scheduler")
+        scheduler = self.stage2_scheduler
         scheduler.set_timesteps(30)
         timesteps = scheduler.timesteps[-15:]
 
+        # Ensure stage1_latent is on the correct device
+        stage1_latent = stage1_latent.to(self.device)
         noise = torch.randn_like(stage1_latent)
         latents = scheduler.add_noise(stage1_latent, noise, timesteps[0])
 
@@ -335,8 +368,25 @@ class FIDKIDValidator:
             encoder_hidden_states = torch.cat([uncond_embeddings, text_embeddings])
             stage1_latent_cfg = torch.cat([stage1_latent] * 2)
 
+            # Duplicate region_graphs for CFG (uncond + cond)
+            region_graphs_cfg = region_graphs + region_graphs
+
+            # Ensure timestep is a tensor on the correct device, properly shaped for batch
+            if isinstance(t, torch.Tensor):
+                t_tensor = t.to(self.device)
+            else:
+                t_tensor = torch.tensor(t, device=self.device)
+            # Expand timestep to batch size (B*2 for CFG)
+            if t_tensor.dim() == 0:
+                t_tensor = t_tensor.unsqueeze(0).expand(latent_model_input.shape[0])
+
+            # Ensure all inputs are on the correct device
+            latent_model_input = latent_model_input.to(self.device)
+            encoder_hidden_states = encoder_hidden_states.to(self.device)
+            stage1_latent_cfg = stage1_latent_cfg.to(self.device)
+
             noise_pred = self.stage2(
-                latent_model_input, t.to(self.device), region_graphs,
+                latent_model_input, t_tensor, region_graphs_cfg,
                 encoder_hidden_states, stage1_latents=stage1_latent_cfg, return_dict=False
             )
 
@@ -394,8 +444,8 @@ class FIDKIDValidator:
 
                 # Accumulate KID features
                 if self.compute_kid and self.kid_metric is not None:
-                    real_feats = self.kid_metric.extract_features(photos_gt)
-                    fake_feats = self.kid_metric.extract_features(generated)
+                    real_feats = self.kid_metric.extract_features(photos_gt.to(self.device))
+                    fake_feats = self.kid_metric.extract_features(generated.to(self.device))
 
                     if real_feats is not None and fake_feats is not None:
                         self.real_features_kid.append(real_feats.cpu())
@@ -404,8 +454,11 @@ class FIDKIDValidator:
                 # Save images for FID
                 if self.compute_fid:
                     for i, file_id in enumerate(file_ids):
-                        gen_img_pil = Image.fromarray((generated[i].cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8))
-                        gt_img_pil = Image.fromarray((photos_gt[i].cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8))
+                        gen_img = generated[i].detach().cpu().clamp(0, 1).numpy()
+                        gt_img = photos_gt[i].detach().cpu().clamp(0, 1).numpy()
+
+                        gen_img_pil = Image.fromarray((gen_img.transpose(1, 2, 0) * 255).astype(np.uint8))
+                        gt_img_pil = Image.fromarray((gt_img.transpose(1, 2, 0) * 255).astype(np.uint8))
                         gen_img_pil.save(temp_gen_dir / f"{file_id}.png")
                         gt_img_pil.save(temp_gt_dir / f"{file_id}.png")
 
@@ -506,7 +559,9 @@ def main():
     parser.add_argument("--guidance_scale", type=float, default=7.5)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--compute_fid", action="store_true", default=True)
+    parser.add_argument("--no-compute_fid", dest="compute_fid", action="store_false")
     parser.add_argument("--compute_kid", action="store_true", default=True)
+    parser.add_argument("--no-compute_kid", dest="compute_kid", action="store_false")
     parser.add_argument("--kid_subset_size", type=int, default=100)
 
     args = parser.parse_args()

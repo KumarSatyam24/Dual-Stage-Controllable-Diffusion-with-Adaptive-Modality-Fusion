@@ -101,6 +101,11 @@ validation_examples/
 wandb/
 logs/
 results/ablation_epoch6/
+results/fid_kid_test/temp_generated/
+results/fid_kid_test/temp_ground_truth/
+results/fid_kid_test/temp_images/
+
+
 
 # Tensorboard
 tensorboard/
