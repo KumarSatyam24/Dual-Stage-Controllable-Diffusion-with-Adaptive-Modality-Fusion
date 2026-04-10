@@ -1,0 +1,42 @@
+{
+  "summary": {
+    "stage1_psnr": 9.878853518519088,
+    "stage2_psnr": 9.96517580936472,
+    "stage1_ssim": 0.43396100401878357,
+    "stage2_ssim": 0.4351637840270996,
+    "stage1_lpips": 0.624223256111145,
+    "stage2_lpips": 0.6228455662727356,
+    "psnr_improvement": 0.08632229084563114,
+    "ssim_improvement": 0.001202780008316029,
+    "lpips_improvement": 0.0013776898384094682
+  },
+  "prompt_samples": [
+    {
+      "original": "A photo of a airplane",
+      "optimized": "A high-quality, realistic photograph of a airplane, based on the description: A photo of a airplane, with natural lighting, sharp details, and accurate colors.",
+      "category": "airplane"
+    },
+    {
+      "original": "A photo of a airplane",
+      "optimized": "A high-quality, realistic photograph of a airplane, based on the description: A photo of a airplane, with natural lighting, sharp details, and accurate colors.",
+      "category": "airplane"
+    },
+    {
+      "original": "A photo of a airplane",
+      "optimized": "A high-quality, realistic photograph of a airplane, based on the description: A photo of a airplane, with natural lighting, sharp details, and accurate colors.",
+      "category": "airplane"
+    },
+    {
+      "original": "A photo of a airplane",
+      "optimized": "A high-quality, realistic photograph of a airplane, based on the description: A photo of a airplane, with natural lighting, sharp details, and accurate colors.",
+      "category": "airplane"
+    },
+    {
+      "original": "A photo of a airplane",
+      "optimized": "A high-quality, realistic photograph of a airplane, based on the description: A photo of a airplane, with natural lighting, sharp details, and accurate colors.",
+      "category": "airplane"
+    }
+  ],
+  "execution_time_seconds": 94.22461915016174,
+  "timestamp": "2026-04-10T21:10:41.239428"
+}

@@ -566,6 +566,7 @@ def main():
     parser.add_argument("--output_dir", type=str, default="./results/is_test")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_samples", type=int, default=-1)
+    
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--num_inference_steps", type=int, default=50)
     parser.add_argument("--guidance_scale", type=float, default=7.5)
