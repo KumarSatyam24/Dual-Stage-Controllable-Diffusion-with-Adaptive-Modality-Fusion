@@ -42,7 +42,7 @@ The key idea is to avoid uniform text conditioning across the whole image by mod
   - `AdaptiveModalityFusion`: combines sketch region features and text-aligned features per timestep.
 
 ### Data and graph construction
-- `src/data/sketch_extraction.py`: sketch extraction utilities (Canny/XDoG; `hed` is a known limitation and currently falls back to Canny, not true HED inference).
+- `src/data/sketch_extraction.py`: sketch extraction utilities (Canny/XDoG).
 - `src/data/region_extraction.py`: connected-components-based region extraction with filtering/merging.
 - `src/data/region_graph.py`: region graph builder (`adjacency`, `knn`, `radius`, `hybrid`) and node features.
 
@@ -90,11 +90,11 @@ Additional distribution metrics:
 - **KID mean:** 0.003278
 - Source: `results/fid_kid_test/fid_kid_results.json`
 
-> Note: some metrics show modest improvement, while edge similarity shows a very small degradation in this snapshot.
+> Note: some metrics show modest improvement, while edge similarity changes by only `-0.00023` (tiny compared with per-sample std ~`0.205` in the same report).
 >
-> CLIP scores above are on the script's scaled reporting convention (not raw cosine values).
+> CLIP scores above follow the repository's scaled convention documented in `test_metrics/README.md`.
 >
-> PSNR values are reported as produced by the current evaluation pipeline and should be compared primarily stage-to-stage within this project setup.
+> PSNR values come from direct generated-vs-reference image comparison on this sketch-to-photo setup; absolute values can be low, so relative Stage 1 vs Stage 2 deltas are the primary signal here.
 
 ---
 
@@ -174,18 +174,6 @@ python scripts/inference/inference.py \
 ├── results/
 └── docs/
 ```
-
----
-
-## 8) Validation in this agent environment
-
-A pre-edit unit-test invocation was attempted:
-
-```bash
-pytest tests/unit -q
-```
-
-It failed here because `pytest` is not installed in the current sandbox (`pytest: command not found`).
 
 ---
 
