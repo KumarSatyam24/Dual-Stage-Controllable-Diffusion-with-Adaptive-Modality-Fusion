@@ -42,7 +42,7 @@ The key idea is to avoid uniform text conditioning across the whole image by mod
   - `AdaptiveModalityFusion`: combines sketch region features and text-aligned features per timestep.
 
 ### Data and graph construction
-- `src/data/sketch_extraction.py`: sketch extraction utilities (Canny/XDoG; `hed` option is currently a fallback to Canny).
+- `src/data/sketch_extraction.py`: sketch extraction utilities (Canny/XDoG; `hed` is a known limitation and currently falls back to Canny, not true HED inference).
 - `src/data/region_extraction.py`: connected-components-based region extraction with filtering/merging.
 - `src/data/region_graph.py`: region graph builder (`adjacency`, `knn`, `radius`, `hybrid`) and node features.
 
@@ -81,7 +81,7 @@ The following values are extracted from checked-in result files under `results/`
 | DISTS (mean, lower better) | 0.3785 | 0.3771 | -0.0014 (reduction) | `results/dists_full/dists_results.json` |
 | PSNR | 9.8789 | 9.9652 | +0.0863 | `results/lpips_psnr_ssim_test/test_lpips_psnr_ssim.json` |
 | SSIM | 0.4340 | 0.4352 | +0.0012 | `results/lpips_psnr_ssim_test/test_lpips_psnr_ssim.json` |
-| LPIPS (lower better) | 0.6242 | 0.6228 | +0.0014 improvement | `results/lpips_psnr_ssim_test/test_lpips_psnr_ssim.json` |
+| LPIPS (lower better) | 0.6242 | 0.6228 | -0.0014 (reduction) | `results/lpips_psnr_ssim_test/test_lpips_psnr_ssim.json` |
 | Inception Score (mean) | 1.3374 | 1.3808 | +0.0433 | `results/is_test/is_results.json` |
 | Edge Similarity (mean) | 0.21127 | 0.21104 | -0.00023 | `results/edge_similarity_test/edge_similarity_results.json` |
 
@@ -90,7 +90,7 @@ Additional distribution metrics:
 - **KID mean:** 0.003278
 - Source: `results/fid_kid_test/fid_kid_results.json`
 
-> Note: some metrics show modest improvement, while edge similarity is effectively neutral (very small decrease in this snapshot).
+> Note: some metrics show modest improvement, while edge similarity shows a very small degradation in this snapshot.
 >
 > CLIP scores above are on the script's scaled reporting convention (not raw cosine values).
 >
