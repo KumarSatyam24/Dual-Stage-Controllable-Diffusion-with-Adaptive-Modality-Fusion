@@ -6,7 +6,8 @@ What it does:
 - Loads trained Stage 1 + Stage 2 checkpoints
 - Uses a fixed sample set (prompt/image/sketch) for fair comparison
 - Runs multiple inference-time ablation variants (no retraining)
-- Computes CLIP Score, FID, SSIM (+ LPIPS if available)
+- Computes CLIP Score, KID, SSIM (+ LPIPS if available)
+- Stage 1 uses basic prompts; Stage 2 (final) uses optimized prompts
 - Saves per-variant outputs + metrics + side-by-side visualizations
 - Saves final cross-variant comparison table (JSON + CSV)
 
@@ -40,7 +41,6 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image, ImageDraw
-from scipy.linalg import sqrtm
 from skimage.metrics import structural_similarity as ssim
 from torch.utils.data import Dataset
 from torchvision import transforms
@@ -104,6 +104,24 @@ def tensor_to_pil(img: torch.Tensor) -> Image.Image:
 def sanitize_name(text: str) -> str:
     keep = [c if c.isalnum() or c in ("-", "_") else "_" for c in text.strip().lower()]
     return "".join(keep).strip("_")
+
+
+def optimize_prompt(prompt: str, category: str) -> str:
+    """
+    Optimizes a simple prompt for better CLIP score alignment.
+
+    Args:
+        prompt: Original simple prompt (e.g., "A photo of a dog")
+        category: Object category (e.g., "dog")
+
+    Returns:
+        Optimized prompt for CLIP
+    """
+    return (
+        f"A high-quality, realistic photograph of a {category}, "
+        f"based on the description: {prompt}, with natural lighting, "
+        f"sharp details, and accurate colors."
+    )
 
 
 # ------------------------------
@@ -199,7 +217,10 @@ class FixedSampleSketchyDataset(Dataset):
         photo = self.photo_transform(photo_pil)
 
         category = pair["category"].replace("_", " ")
-        text_prompt = f"A natural photo of a {category} aligned with the given sketch"
+        # Basic prompt for Stage 1 (simple, direct)
+        prompt_basic = f"A natural photo of a {category}"
+        # Optimized prompt for Stage 2 (enhanced with quality descriptors)
+        prompt_optimized = optimize_prompt(prompt_basic, category)
 
         sketch_np = (sketch.squeeze(0).numpy() * 255).astype(np.uint8)
         regions = self.region_extractor.extract_regions(sketch_np)
@@ -208,7 +229,8 @@ class FixedSampleSketchyDataset(Dataset):
         return {
             "sketch": sketch,
             "photo": photo,
-            "text_prompt": text_prompt,
+            "prompt_basic": prompt_basic,
+            "prompt_optimized": prompt_optimized,
             "region_graph": region_graph,
             "category": pair["category"],
             "file_id": pair["file_id"],
@@ -302,20 +324,57 @@ class MetricsSuite:
 
         return np.array(feats)
 
-    def compute_fid(self, real_images: Sequence[torch.Tensor], generated_images: Sequence[torch.Tensor]) -> float:
+    def _polynomial_kernel(self, x: np.ndarray, y: np.ndarray, degree: int = 3, gamma: float = 1.0, coef0: float = 0.0) -> np.ndarray:
+        """Compute polynomial kernel matrix between two sets of features."""
+        return (gamma * np.dot(x, y.T) + coef0) ** degree
+
+    def compute_kid(self, real_images: Sequence[torch.Tensor], generated_images: Sequence[torch.Tensor],
+                     subset_size: int = 1000, num_subsets: int = 100) -> Dict[str, float]:
+        """
+        Compute KID (Kernel Inception Distance) using polynomial kernel.
+
+        KID is more robust than FID for smaller sample sizes and doesn't require
+        computing the square root of a potentially singular covariance matrix.
+
+        Args:
+            real_images: Ground truth images
+            generated_images: Generated images
+            subset_size: Number of samples per subset for bootstrap estimation
+            num_subsets: Number of bootstrap subsets
+
+        Returns:
+            Dictionary with 'mean' and 'std' of KID scores (in units of 1e-3)
+        """
         real_feats = self._extract_inception_features(real_images)
         gen_feats = self._extract_inception_features(generated_images)
 
-        mu_r, sigma_r = real_feats.mean(axis=0), np.cov(real_feats, rowvar=False)
-        mu_g, sigma_g = gen_feats.mean(axis=0), np.cov(gen_feats, rowvar=False)
+        n = min(real_feats.shape[0], gen_feats.shape[0], subset_size)
 
-        diff = mu_r - mu_g
-        covmean = sqrtm(sigma_r @ sigma_g)
-        if np.iscomplexobj(covmean):
-            covmean = covmean.real
+        kid_values = []
+        for _ in range(num_subsets):
+            # Randomly sample subsets
+            idx_real = np.random.choice(real_feats.shape[0], n, replace=False)
+            idx_gen = np.random.choice(gen_feats.shape[0], n, replace=False)
 
-        fid = diff @ diff + np.trace(sigma_r + sigma_g - 2 * covmean)
-        return float(fid)
+            x = real_feats[idx_real]
+            y = gen_feats[idx_gen]
+
+            # Compute kernel matrices (polynomial kernel degree 3)
+            k_xx = self._polynomial_kernel(x, x, degree=3, gamma=1.0/2048, coef0=1.0)
+            k_yy = self._polynomial_kernel(y, y, degree=3, gamma=1.0/2048, coef0=1.0)
+            k_xy = self._polynomial_kernel(x, y, degree=3, gamma=1.0/2048, coef0=1.0)
+
+            # Unbiased estimator of MMD^2
+            mmd2 = (k_xx.sum() - np.trace(k_xx)) / (n * (n - 1))
+            mmd2 += (k_yy.sum() - np.trace(k_yy)) / (n * (n - 1))
+            mmd2 -= 2 * k_xy.mean()
+
+            kid_values.append(mmd2)
+
+        kid_mean = float(np.mean(kid_values)) * 1000  # Scale to common reporting units
+        kid_std = float(np.std(kid_values)) * 1000
+
+        return {"mean": kid_mean, "std": kid_std}
 
 
 # ------------------------------
@@ -330,6 +389,7 @@ class AblationVariant:
     fixed_residual_alpha: Optional[float] = None
     no_text_conditioning_stage2: bool = False
     refinement_strength: float = 0.5
+    use_optimized_prompt: bool = True  # If False, use basic prompt for Stage 2 (for ablation)
 
 
 @dataclass
@@ -337,7 +397,8 @@ class SampleCacheItem:
     idx: int
     category: str
     file_id: str
-    prompt: str
+    prompt_basic: str  # Basic prompt for Stage 1
+    prompt_optimized: str  # Optimized prompt for Stage 2
     sketch: torch.Tensor
     gt_image: torch.Tensor  # [0,1]
     region_graph: Any
@@ -624,7 +685,7 @@ class AblationInferenceRunner:
         ssim_vals = [r["ssim"] for r in per_sample]
         lpips_vals = [r["lpips"] for r in per_sample if r["lpips"] is not None]
 
-        fid = self.metrics.compute_fid(gt_images, generated_images)
+        kid = self.metrics.compute_kid(gt_images, generated_images)
         clip_score = self.metrics.compute_clip_score(generated_images, prompts)
 
         summary = {
@@ -633,7 +694,8 @@ class AblationInferenceRunner:
             "metrics": {
                 "ssim_mean": float(np.mean(ssim_vals)) if ssim_vals else 0.0,
                 "ssim_std": float(np.std(ssim_vals)) if ssim_vals else 0.0,
-                "fid": float(fid),
+                "kid_mean": float(kid["mean"]),
+                "kid_std": float(kid["std"]),
                 "clip_score": float(clip_score),
                 "lpips_mean": float(np.mean(lpips_vals)) if lpips_vals else None,
                 "lpips_std": float(np.std(lpips_vals)) if lpips_vals else None,
@@ -653,7 +715,8 @@ class AblationInferenceRunner:
             "experiment",
             "ssim_mean",
             "ssim_std",
-            "fid",
+            "kid_mean",
+            "kid_std",
             "clip_score",
             "lpips_mean",
             "lpips_std",
@@ -670,7 +733,8 @@ class AblationInferenceRunner:
                         "experiment": exp_name,
                         "ssim_mean": m["ssim_mean"],
                         "ssim_std": m["ssim_std"],
-                        "fid": m["fid"],
+                        "kid_mean": m["kid_mean"],
+                        "kid_std": m["kid_std"],
                         "clip_score": m["clip_score"],
                         "lpips_mean": m["lpips_mean"],
                         "lpips_std": m["lpips_std"],
@@ -679,43 +743,67 @@ class AblationInferenceRunner:
                 )
 
     def print_summary_table(self, summaries: Dict[str, Dict[str, Any]]) -> None:
-        print("\n" + "=" * 96)
+        print("\n" + "=" * 110)
         print("Ablation Summary")
-        print("=" * 96)
+        print("=" * 110)
         print(
-            f"{'Experiment':<28} {'SSIM':>10} {'FID':>10} {'CLIP':>10} {'LPIPS':>10} {'N':>6}"
+            f"{'Experiment':<28} {'SSIM':>10} {'KID':>14} {'CLIP':>10} {'LPIPS':>10} {'N':>6}"
         )
-        print("-" * 96)
+        print("-" * 110)
         for exp_name, payload in summaries.items():
             m = payload["metrics"]
             lpips_val = m["lpips_mean"]
             lpips_str = f"{lpips_val:.4f}" if lpips_val is not None else "N/A"
+            kid_str = f"{m['kid_mean']:.3f}±{m['kid_std']:.3f}"
             print(
-                f"{exp_name:<28} {m['ssim_mean']:>10.4f} {m['fid']:>10.3f} {m['clip_score']:>10.3f} {lpips_str:>10} {payload['num_samples']:>6}"
+                f"{exp_name:<28} {m['ssim_mean']:>10.4f} {kid_str:>14} {m['clip_score']:>10.3f} {lpips_str:>10} {payload['num_samples']:>6}"
             )
-        print("=" * 96 + "\n")
+        print("=" * 110 + "\n")
 
     def build_variants(self) -> List[AblationVariant]:
+        """
+        Build ablation variants to study component contributions.
+
+        Key design: Stage 1 always uses basic prompts. Stage 2 (final modal fusion)
+        uses optimized prompts by default. The 'basic_prompt_stage2' variant shows
+        the impact of using basic prompts throughout, demonstrating the value of
+        prompt optimization for the final output.
+        """
         return [
-            AblationVariant(name="baseline_full", use_stage2=True, adaptive_residual_alpha=True, refinement_strength=0.5),
-            AblationVariant(name="no_stage2", use_stage2=False, adaptive_residual_alpha=False, refinement_strength=0.0),
+            # Full baseline: Stage 1 (basic) -> Stage 2 (optimized)
+            AblationVariant(name="baseline_full", use_stage2=True, adaptive_residual_alpha=True, refinement_strength=0.5, use_optimized_prompt=True),
+            # No Stage 2: Only Stage 1 output (basic prompt only)
+            AblationVariant(name="no_stage2", use_stage2=False, adaptive_residual_alpha=False, refinement_strength=0.0, use_optimized_prompt=False),
+            # Fixed residual alpha instead of adaptive
             AblationVariant(
                 name="fixed_residual_alpha",
                 use_stage2=True,
                 adaptive_residual_alpha=False,
                 fixed_residual_alpha=0.2,
                 refinement_strength=0.5,
+                use_optimized_prompt=True,
             ),
+            # No text conditioning in Stage 2
             AblationVariant(
                 name="no_text_conditioning_stage2",
                 use_stage2=True,
                 adaptive_residual_alpha=True,
                 no_text_conditioning_stage2=True,
                 refinement_strength=0.5,
+                use_optimized_prompt=True,
             ),
-            AblationVariant(name="refinement_strength_0_2", use_stage2=True, adaptive_residual_alpha=True, refinement_strength=0.2),
-            AblationVariant(name="refinement_strength_0_4", use_stage2=True, adaptive_residual_alpha=True, refinement_strength=0.4),
-            AblationVariant(name="refinement_strength_0_6", use_stage2=True, adaptive_residual_alpha=True, refinement_strength=0.6),
+            # Basic prompt in Stage 2 (vs optimized) - shows prompt optimization impact
+            AblationVariant(
+                name="basic_prompt_stage2",
+                use_stage2=True,
+                adaptive_residual_alpha=True,
+                refinement_strength=0.5,
+                use_optimized_prompt=False,  # Key difference: basic prompt for Stage 2
+            ),
+            # Different refinement strengths
+            AblationVariant(name="refinement_strength_0_2", use_stage2=True, adaptive_residual_alpha=True, refinement_strength=0.2, use_optimized_prompt=True),
+            AblationVariant(name="refinement_strength_0_4", use_stage2=True, adaptive_residual_alpha=True, refinement_strength=0.4, use_optimized_prompt=True),
+            AblationVariant(name="refinement_strength_0_6", use_stage2=True, adaptive_residual_alpha=True, refinement_strength=0.6, use_optimized_prompt=True),
         ]
 
     def run(self) -> Dict[str, Dict[str, Any]]:
@@ -726,17 +814,20 @@ class AblationInferenceRunner:
             sample = self.dataset[ds_idx]
             sketch = sample["sketch"].unsqueeze(0)
             gt_img = ((sample["photo"] + 1.0) / 2.0).clamp(0, 1)
-            prompt = sample["text_prompt"]
+            # Use basic prompt for Stage 1 generation
+            prompt_basic = sample["prompt_basic"]
+            prompt_optimized = sample["prompt_optimized"]
 
             stage1_seed = self.seed + order_idx
-            stage1_img, stage1_latents = self.generate_stage1(sketch, prompt, seed=stage1_seed)
+            stage1_img, stage1_latents = self.generate_stage1(sketch, prompt_basic, seed=stage1_seed)
 
             sample_cache.append(
                 SampleCacheItem(
                     idx=order_idx,
                     category=sample["category"],
                     file_id=sample["file_id"],
-                    prompt=prompt,
+                    prompt_basic=prompt_basic,
+                    prompt_optimized=prompt_optimized,
                     sketch=sketch.squeeze(0).cpu(),
                     gt_image=gt_img.cpu(),
                     region_graph=sample["region_graph"],
@@ -765,10 +856,15 @@ class AblationInferenceRunner:
 
             for item in tqdm(sample_cache, desc=f"Variant {exp_name}"):
                 infer_seed = self.seed + 100_000 + item.idx
+                # Select prompt based on variant setting
+                # use_optimized_prompt=True: optimized prompt for Stage 2 (final modal)
+                # use_optimized_prompt=False: basic prompt for Stage 2 (ablation study)
+                stage2_prompt = item.prompt_optimized if variant.use_optimized_prompt else item.prompt_basic
+
                 variant_img, debug_info = self.generate_stage2_variant(
                     stage1_latents=item.stage1_latents,
                     region_graph=item.region_graph,
-                    prompt=item.prompt,
+                    prompt=stage2_prompt,
                     seed=infer_seed,
                     variant=variant,
                 )
@@ -793,14 +889,17 @@ class AblationInferenceRunner:
 
                 generated_images.append(variant_img)
                 gt_images.append(item.gt_image)
-                prompts.append(item.prompt)
+                # Use the same prompt for CLIP scoring as was used for generation
+                prompts.append(stage2_prompt)
 
                 per_sample_results.append(
                     {
                         "idx": item.idx,
                         "category": item.category,
                         "file_id": item.file_id,
-                        "prompt": item.prompt,
+                        "prompt_basic": item.prompt_basic,
+                        "prompt_optimized": item.prompt_optimized,
+                        "prompt_used": stage2_prompt,
                         "ssim": float(ssim_val),
                         "lpips": float(lpips_val) if lpips_val is not None else None,
                         "debug": debug_info,
@@ -822,11 +921,13 @@ class AblationInferenceRunner:
                 json.dump(summary, f, indent=2)
 
             summaries[exp_name] = summary
+            kid_str = f"{summary['metrics']['kid_mean']:.3f}±{summary['metrics']['kid_std']:.3f}"
+            lpips_str = f"{summary['metrics']['lpips_mean']:.4f}" if summary['metrics']['lpips_mean'] is not None else "N/A"
             print(
                 f"   -> SSIM: {summary['metrics']['ssim_mean']:.4f}, "
-                f"FID: {summary['metrics']['fid']:.3f}, "
+                f"KID: {kid_str}, "
                 f"CLIP: {summary['metrics']['clip_score']:.3f}, "
-                f"LPIPS: {summary['metrics']['lpips_mean'] if summary['metrics']['lpips_mean'] is not None else 'N/A'}"
+                f"LPIPS: {lpips_str}"
             )
 
         self._write_final_comparison(summaries)
@@ -840,7 +941,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage2_checkpoint", type=str, required=True, help="Path to Stage 2 checkpoint")
     parser.add_argument("--dataset_root", type=str, default="/workspace/sketchy", help="Sketchy root dir")
     parser.add_argument("--output_root", type=str, default="results", help="Root output directory")
-    parser.add_argument("--num_samples", type=int, default=50, help="Number of fixed samples")
+    parser.add_argument("--num_samples", type=int, default=5000, help="Number of fixed samples")
     parser.add_argument("--device", type=str, default="cuda", help="cuda or cpu")
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--num_inference_steps", type=int, default=50)

@@ -104,7 +104,15 @@ results/ablation_epoch6/
 results/fid_kid_test/temp_generated/
 results/fid_kid_test/temp_ground_truth/
 results/fid_kid_test/temp_images/
-
+results/baseline_full/
+results/basic_prompt_stage2/
+results/fixed_residual_alpha/
+results/no_stage2/
+results/no_text_conditioning_stage2/
+results/refinement_strength_0_2/
+results/refinement_strength_0_4/
+results/refinement_strength_0_6/
+results/ablation_comparison.json
 
 
 # Tensorboard
